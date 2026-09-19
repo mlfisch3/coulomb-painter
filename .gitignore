@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Node / web tooling
+node_modules/
+.parcel-cache/
+.svelte-kit/
+.next/
+.vite/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local dev artefacts
+.env
+.envrc
+.direnv/
+*.log
+
+# App runtime state
+runs/
+out_*/
+tmp/
+.lavish/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
