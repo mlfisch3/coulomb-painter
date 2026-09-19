@@ -1,0 +1,33 @@
+[project]
+name = "coulomb-painter"
+version = "0.1.0"
+description = "A Photoshop-shaped painter for Coulomb-gas dynamics."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "numpy>=1.24,<3",
+    "scipy>=1.10,<2",
+    "Pillow>=10.0,<12",
+    "flask>=3.0,<4",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda12x>=13.0"]
+
+[project.scripts]
+coulomb-painter = "coulomb_painter.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["coulomb_painter*"]
+
+[tool.setuptools.package-data]
+"coulomb_painter" = ["web/*.html", "web/*.css", "web/*.js"]
