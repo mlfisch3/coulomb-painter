@@ -1,127 +1,226 @@
-// Coulomb Painter front-end. Kept intentionally small: one file, no build.
+// Coulomb Painter front-end. One file, no build.
 //
-// The canvas <img> is refreshed by URL-with-timestamp polling; painting is
-// driven by pointer events converted into lattice coordinates and posted to
-// /api/paint. Controls are two-way bound to server params so a slider in the
-// tab panel and the segmented sign toggle at the bottom refer to the same
-// state.
+// The client mirrors the reference `anneal_gui.py` frontend: every knob has a
+// two-way binding to server params, changes commit with an ack flash, and
+// build-only fields go through /api/init.  Mobile-first layout: no page
+// scroll, canvas anchors the view, controls that don't fit live behind a
+// tabbed Controls popup or a menu popover.
 
-const $ = (q, root=document) => root.querySelector(q);
+const $  = (q, root=document) => root.querySelector(q);
 const $$ = (q, root=document) => Array.from(root.querySelectorAll(q));
 
+// ---------- state ----------
 const state = {
   params: null,
   stats: null,
-  lattice: [256, 256],
+  lattice: [512, 512],
+  // brush
   painting: false,
+  paintMode: false,
   packet: [],
   paintTimer: null,
+  sentFirst: false,
+  // lens
+  lensOn: false, lensSpan: 160,
+  lensPinned: false, lensAt: null, lensBusy: false, lensPend: null,
 };
 
-// ------- server IO -------
+// ---------- HTTP helpers ----------
 async function api(path, opts) {
   const r = await fetch(path, opts);
   if (!r.ok) throw new Error(`${path}: ${r.status}`);
   return r.json();
 }
-
-async function refreshState() {
-  const s = await api('/api/state');
-  state.params = s.params;
-  state.stats = s.stats;
-  state.lattice = s.stats.lattice;
-  renderStatus();
-  syncControls();
-}
-
-async function pushParams(patch) {
-  const s = await api('/api/params', {
+async function post(url, body) {
+  return api(url, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(patch),
+    body: JSON.stringify(body || {}),
   });
-  Object.assign(state.params, s.applied);
+}
+async function refreshState() {
+  try {
+    const s = await api('/api/state');
+    state.params = s.params;
+    state.stats = s.stats;
+    state.lattice = s.stats.lattice;
+    renderStatus();
+    syncControls();
+  } catch (e) { /* the periodic loop will keep trying */ }
+}
+async function pushParams(patch) {
+  const s = await post('/api/update', patch);
+  Object.assign(state.params, s.applied || {});
   return s;
 }
 
-// ------- status -------
+// ---------- status ----------
 function renderStatus() {
   const s = state.stats; if (!s) return;
   const parts = [
     `${s.lattice[0]}×${s.lattice[1]}`,
     `n=${s.particles}`,
-    `T=${Math.round(s.temperature)} K`,
-    `${(s.moves_per_s/1e3).toFixed(1)} kmoves/s`,
-    s.frozen ? 'FROZEN' : (s.paused ? 'PAUSED' : ''),
+    `T=${Math.round(s.temperature)}K`,
+    `${(s.moves_per_s/1e3).toFixed(1)}k moves/s`,
+    `iter=${s.iteration}`,
+    s.frozen ? 'FROZEN' : (s.paused ? 'HELD' : 'RUN'),
   ];
-  $('#status').textContent = parts.filter(Boolean).join('  ·  ');
+  $('#status').textContent = parts.join('  ·  ');
 }
 
-// ------- controls: sync UI to server -------
+// ---------- ack flash ----------
+function ack(el, ok) {
+  if (!el) return;
+  el.classList.remove('ack-ok', 'ack-bad');
+  void el.offsetWidth;
+  el.classList.add(ok ? 'ack-ok' : 'ack-bad');
+  setTimeout(() => el.classList.remove('ack-ok', 'ack-bad'), 800);
+}
+
+// ---------- controls: build panel widgets ----------
+function buildFieldWidgets() {
+  // .field-num - a numeric input bound to a param key
+  $$('.field-num').forEach(node => {
+    if (node.dataset.built) return;
+    node.dataset.built = '1';
+    const inp = document.createElement('input');
+    inp.type = 'number';
+    if (node.dataset.min !== undefined) inp.min = node.dataset.min;
+    if (node.dataset.max !== undefined) inp.max = node.dataset.max;
+    if (node.dataset.step !== undefined) inp.step = node.dataset.step;
+    node.appendChild(inp);
+    const commit = () => {
+      const v = parseFloat(inp.value);
+      if (isNaN(v)) return ack(inp, false);
+      if (node.dataset.local) {
+        applyLocal(node.dataset.key, v);
+        ack(inp, true);
+        return;
+      }
+      const patch = {}; patch[node.dataset.key] = v;
+      pushParams(patch).then(() => ack(inp, true)).catch(() => ack(inp, false));
+    };
+    inp.addEventListener('change', commit);
+    inp.addEventListener('keydown', ev => {
+      if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+    });
+  });
+  // .field-bool - a checkbox
+  $$('.field-bool').forEach(node => {
+    if (node.dataset.built) return;
+    node.dataset.built = '1';
+    const inp = document.createElement('input');
+    inp.type = 'checkbox';
+    node.appendChild(inp);
+    inp.addEventListener('change', () => {
+      if (node.dataset.local) { applyLocal(node.dataset.key, inp.checked); return; }
+      const patch = {}; patch[node.dataset.key] = inp.checked;
+      pushParams(patch).then(() => ack(inp, true)).catch(() => ack(inp, false));
+    });
+  });
+  // .field-sel - a select
+  $$('.field-sel').forEach(node => {
+    if (node.dataset.built) return;
+    node.dataset.built = '1';
+    const sel = document.createElement('select');
+    node.appendChild(sel);
+    setSelectOptions(sel, (node.dataset.opts || '').split(',').filter(Boolean));
+    sel.addEventListener('change', () => {
+      const key = node.dataset.key;
+      if (key === 'image') {
+        // image is a build-only field
+        rebuildWithImage(sel.value).then(() => ack(sel, true)).catch(() => ack(sel, false));
+        return;
+      }
+      const patch = {}; patch[key] = sel.value;
+      pushParams(patch).then(() => ack(sel, true)).catch(() => ack(sel, false));
+    });
+  });
+}
+function setSelectOptions(sel, opts) {
+  const cur = sel.value;
+  sel.innerHTML = opts.map(o => `<option value="${o}">${o}</option>`).join('');
+  if (opts.includes(cur)) sel.value = cur;
+}
+
+function applyLocal(key, value) {
+  if (key === 'lens_on') { state.lensOn = !!value; $('#lens-wrap').classList.toggle('hidden', !state.lensOn); }
+  else if (key === 'lens_span') { state.lensSpan = Math.max(16, Math.min(2048, Math.round(value))); if (state.lensAt) lensFetch(state.lensAt[0], state.lensAt[1]); }
+}
+
+async function loadImagesList() {
+  try {
+    const list = await api('/api/images');
+    $$('.field-sel[data-key="image"] select').forEach(s => {
+      setSelectOptions(s, list);
+      if (state.params) s.value = state.params.image;
+    });
+  } catch (e) {}
+}
+
+// Push value from server params into UI widget for a given key/node
+function writeFieldValue(node) {
+  const key = node.dataset.key;
+  if (node.dataset.local) {
+    const inp = node.querySelector('input');
+    if (!inp) return;
+    if (key === 'lens_on') inp.checked = state.lensOn;
+    if (key === 'lens_span') inp.value = state.lensSpan;
+    return;
+  }
+  const p = state.params; if (!p || !(key in p)) return;
+  const inp = node.querySelector('input, select');
+  if (!inp) return;
+  if (inp.type === 'checkbox') { inp.checked = !!p[key]; return; }
+  if (inp.tagName === 'SELECT') { if ([...inp.options].some(o => o.value === String(p[key]))) inp.value = String(p[key]); return; }
+  inp.value = p[key];
+}
+
 function syncControls() {
   const p = state.params; if (!p) return;
-  // sign
-  toggleSeg($('#sign-plus'), $('#sign-minus'), p.brush_sign >= 0);
-  // target
-  toggleSeg($('#target-fixed'), $('#target-mobile'), p.brush_target !== 'mobile');
-  // thickness
+  // segmented toggles at the bottom
+  $('#sign-plus').classList.toggle('on', p.brush_sign >= 0);
+  $('#sign-minus').classList.toggle('on', p.brush_sign < 0);
+  $('#target-fixed').classList.toggle('on', p.brush_target !== 'mobile');
+  $('#target-mobile').classList.toggle('on', p.brush_target === 'mobile');
   $('#thickness').value = p.brush_thickness;
-  // freeze/pause/live
+  $('#thickness-out').textContent = Math.round(p.brush_thickness);
+  // top bar toggles
+  $('#run-btn').textContent = p.paused ? 'Anneal' : 'Pause';
+  $('#run-btn').classList.toggle('on', !p.paused);
   $('#freeze-btn').classList.toggle('on', !!p.frozen);
   $('#freeze-btn').textContent = p.frozen ? 'Run' : 'Freeze';
-  $('#pause-btn').classList.toggle('on', !!p.paused);
-  $('#pause-btn').textContent = p.paused ? 'Resume' : 'Pause';
-  $('#live-btn').classList.toggle('on', !!p.live_view);
-  // panel sliders
-  for (const el of $$('.pctrl')) {
-    const k = el.dataset.key;
-    if (k in p) {
-      el.value = p[k];
-      const out = el.parentElement.querySelector('output');
-      if (out) out.textContent = fmt(p[k]);
-    }
-  }
-  // segmented pairs (periodic, cooling)
-  for (const seg of $$('.field .seg')) {
-    const btns = $$('.seg-btn', seg);
-    const key = btns[0]?.dataset.key;
-    if (!key) continue;
-    const cur = p[key];
-    for (const b of btns) {
-      const on = Number(b.dataset.val) === (cur ? 1 : 0);
-      b.classList.toggle('on', on);
-    }
-  }
-}
-function toggleSeg(a, b, aOn) {
-  a.classList.toggle('on', aOn);
-  b.classList.toggle('on', !aOn);
-}
-function fmt(v) {
-  if (typeof v === 'boolean') return v ? 'on' : 'off';
-  if (Number.isInteger(v)) return String(v);
-  if (typeof v === 'number') return Math.abs(v) < 10 ? v.toFixed(2) : v.toFixed(0);
-  return String(v);
+  $('#lens-btn').classList.toggle('on', state.lensOn);
+  $('#paint-mode-btn').classList.toggle('on', state.paintMode);
+  $('#canvas-wrap').classList.toggle('painting', state.paintMode);
+  // panel field widgets
+  $$('.field-num, .field-bool, .field-sel').forEach(writeFieldValue);
 }
 
-// ------- frame loop -------
-const FRAME_MS = 100;
+// ---------- rebuilds ----------
+async function rebuildWithImage(image) {
+  const p = Object.assign({}, state.params || {}, { image });
+  await post('/api/init', p);
+  await refreshState();
+}
+
+// ---------- frame loop ----------
 let framePending = false;
 function tickFrame() {
   if (framePending) return;
-  const p = state.params; if (!p || !p.live_view) return;
+  const p = state.params;
+  if (p && !p.live_view) return;
   framePending = true;
   const im = new Image();
-  im.onload = () => { $('#frame').src = im.src; framePending = false; };
+  im.onload  = () => { $('#frame').src = im.src; framePending = false; };
   im.onerror = () => { framePending = false; };
-  im.src = `/api/frame.png?t=${Date.now()}`;
+  const mp = p && p.display_px ? p.display_px : 1000;
+  im.src = `/api/frame.png?max_px=${mp}&t=${Date.now()}`;
 }
-setInterval(tickFrame, FRAME_MS);
-setInterval(() => api('/api/state').then(s => {
-  state.stats = s.stats; renderStatus();
-}).catch(()=>{}), 500);
+setInterval(tickFrame, 120);
+setInterval(() => refreshState(), 700);
 
-// ------- pointer painting -------
+// ---------- painting ----------
 function frameToLattice(ev) {
   const img = $('#frame');
   const r = img.getBoundingClientRect();
@@ -131,37 +230,36 @@ function frameToLattice(ev) {
 }
 function flushPacket(last=false) {
   if (state.packet.length === 0 && !last) return;
-  const body = JSON.stringify({
-    points: state.packet,
-    first: !state.sentFirst,
-    last,
-  });
+  const body = { points: state.packet, first: !state.sentFirst, last };
   state.packet = [];
   state.sentFirst = true;
   fetch('/api/paint', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body,
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
   }).then(r => r.json()).then(j => {
     if (j.stats) { state.stats = j.stats; renderStatus(); }
   }).catch(()=>{});
 }
 function onPointerDown(ev) {
+  if (!state.paintMode) return;             // free hover otherwise
   if (ev.button !== undefined && ev.button !== 0) return;
   ev.preventDefault();
   state.painting = true;
   state.packet = [frameToLattice(ev)];
   state.sentFirst = false;
   flushPacket(false);
-  $('#frame').setPointerCapture?.(ev.pointerId);
-  // send packets on a timer so a fast drag does not spam the network
+  ev.target.setPointerCapture?.(ev.pointerId);
   clearInterval(state.paintTimer);
   state.paintTimer = setInterval(() => flushPacket(false), 40);
 }
 function onPointerMove(ev) {
-  if (!state.painting) return;
-  ev.preventDefault();
-  state.packet.push(frameToLattice(ev));
+  if (state.painting) { ev.preventDefault(); state.packet.push(frameToLattice(ev)); return; }
+  // hover: lens follow
+  if (!state.lensOn || state.lensPinned) return;
+  const p = frameToLattice(ev);
+  state.lensAt = p;
+  lensFetch(p[0], p[1]);
+  updateLensLabel();
 }
 function onPointerUp(ev) {
   if (!state.painting) return;
@@ -171,135 +269,225 @@ function onPointerUp(ev) {
   state.painting = false;
   flushPacket(true);
 }
+function onCanvasTap(ev) {
+  // A pointerup that did not paint pins/unpins the lens (paint mode owns
+  // taps when armed).
+  if (state.paintMode) return;
+  if (!state.lensOn) return;
+  const p = frameToLattice(ev);
+  if (!state.lensPinned) { state.lensAt = p; }
+  state.lensPinned = !state.lensPinned;
+  updateLensLabel();
+  if (state.lensAt) lensFetch(state.lensAt[0], state.lensAt[1]);
+}
+
+function updateLensLabel() {
+  const el = $('#lens-label');
+  if (!el || !state.lensAt) return;
+  el.textContent = `${Math.round(state.lensAt[0])}, ${Math.round(state.lensAt[1])}`
+    + (state.lensPinned ? ' [pinned]' : '');
+}
+function lensFetch(x, y) {
+  if (!state.lensOn) return;
+  if (state.lensBusy) { state.lensPend = [x, y]; return; }
+  state.lensBusy = true;
+  const span = state.lensSpan;
+  const im = new Image();
+  im.onload = () => { $('#lens').src = im.src; state.lensBusy = false;
+    if (state.lensPend) { const p = state.lensPend; state.lensPend = null; lensFetch(p[0], p[1]); } };
+  im.onerror = () => { state.lensBusy = false; };
+  im.src = `/api/zoom.png?cx=${Math.round(x)}&cy=${Math.round(y)}` +
+           `&span=${span}&out=560&t=${Date.now()}`;
+}
+setInterval(() => {
+  if (!state.lensOn || !state.lensPinned || !state.lensAt) return;
+  lensFetch(state.lensAt[0], state.lensAt[1]);
+}, 400);
+
 const imgEl = $('#frame');
 imgEl.addEventListener('pointerdown', onPointerDown);
 imgEl.addEventListener('pointermove', onPointerMove);
-imgEl.addEventListener('pointerup', onPointerUp);
+imgEl.addEventListener('pointerup', ev => { const painted = state.painting; onPointerUp(ev); if (!painted) onCanvasTap(ev); });
 imgEl.addEventListener('pointercancel', onPointerUp);
 imgEl.addEventListener('contextmenu', e => e.preventDefault());
 
-// ------- top bar buttons -------
-$('#pause-btn').onclick = () =>
-  pushParams({ paused: !state.params.paused }).then(syncControls);
-$('#freeze-btn').onclick = () =>
-  pushParams({ frozen: !state.params.frozen }).then(syncControls);
-$('#live-btn').onclick = () =>
-  pushParams({ live_view: !state.params.live_view }).then(syncControls);
+// ---------- top bar buttons ----------
+$('#run-btn').onclick = async () => {
+  const running = !state.params?.paused && !state.params?.frozen;
+  const r = await post('/api/control', { action: running ? 'pause' : 'run' });
+  if (r.stats) { state.stats = r.stats; state.params = r.params; renderStatus(); syncControls(); }
+};
+$('#step-btn').onclick = async () => {
+  const r = await post('/api/control', { action: 'step' });
+  if (r.stats) { state.stats = r.stats; state.params = r.params; renderStatus(); syncControls(); }
+  tickFrame();
+};
+$('#freeze-btn').onclick = async () => {
+  const wantFreeze = !state.params?.frozen;
+  const r = await post('/api/control', { action: wantFreeze ? 'freeze' : 'unfreeze' });
+  if (r.stats) { state.stats = r.stats; state.params = r.params; renderStatus(); syncControls(); }
+};
+$('#autoT-btn').onclick = async () => {
+  const r = await post('/api/control', { action: 'auto_temp' });
+  if (r.stats) { state.stats = r.stats; state.params = r.params; renderStatus(); syncControls(); }
+  toast(r.temperature ? `T -> ${Math.round(r.temperature)} K` : 'no uphill moves');
+};
+$('#lens-btn').onclick = () => {
+  state.lensOn = !state.lensOn;
+  $('#lens-wrap').classList.toggle('hidden', !state.lensOn);
+  syncControls();
+  if (state.lensOn) togglePopover($('#lens-panel'));
+  else $('#lens-panel').classList.add('hidden');
+};
 
-// ------- bottom bar buttons -------
-$('#sign-plus').onclick = () =>
-  pushParams({ brush_sign: 1 }).then(syncControls);
-$('#sign-minus').onclick = () =>
-  pushParams({ brush_sign: -1 }).then(syncControls);
-$('#target-fixed').onclick = () =>
-  pushParams({ brush_target: 'fixed' }).then(syncControls);
-$('#target-mobile').onclick = () =>
-  pushParams({ brush_target: 'mobile' }).then(syncControls);
-$('#thickness').oninput = e =>
-  pushParams({ brush_thickness: Number(e.target.value) });
+// ---------- bottom bar ----------
+$('#sign-plus').onclick   = () => pushParams({ brush_sign:  1 }).then(syncControls);
+$('#sign-minus').onclick  = () => pushParams({ brush_sign: -1 }).then(syncControls);
+$('#target-fixed').onclick  = () => pushParams({ brush_target: 'fixed'  }).then(syncControls);
+$('#target-mobile').onclick = () => pushParams({ brush_target: 'mobile' }).then(syncControls);
+$('#paint-mode-btn').onclick = () => {
+  state.paintMode = !state.paintMode;
+  syncControls();
+};
+$('#thickness').oninput = () => {
+  $('#thickness-out').textContent = $('#thickness').value;
+};
+$('#thickness').onchange = () => {
+  pushParams({ brush_thickness: Number($('#thickness').value) });
+};
 
-// ------- menu / popover -------
-function togglePanel(el) {
+// ---------- menu / popover ----------
+function togglePopover(el) {
   const opening = el.classList.contains('hidden');
-  // close everything, then open this one
   $$('.popover, .panel').forEach(p => p.classList.add('hidden'));
   if (opening) el.classList.remove('hidden');
 }
-$('#menu-btn').onclick = () => togglePanel($('#menu-panel'));
-$('#panel-btn').onclick = () => togglePanel($('#panel'));
+$('#menu-btn').onclick   = () => togglePopover($('#menu-panel'));
+$('#panel-btn').onclick  = () => togglePopover($('#panel'));
 $('#panel-close').onclick = () => $('#panel').classList.add('hidden');
-$('#mn-reset').onclick = async () => {
-  $('#menu-panel').classList.add('hidden');
-  await api('/api/reset', { method: 'POST' });
-  await refreshState();
+
+$('#mn-new').onclick    = () => { $('#menu-panel').classList.add('hidden'); openNewDialog(); };
+$('#mn-reset').onclick  = async () => { $('#menu-panel').classList.add('hidden');
+  const r = await post('/api/control', { action: 'reset' });
+  if (r.stats) { state.stats = r.stats; state.params = r.params; renderStatus(); syncControls(); }
+  tickFrame();
 };
-$('#mn-new').onclick = () => {
-  $('#menu-panel').classList.add('hidden');
-  openNewDialog();
+$('#mn-add').onclick    = async () => { $('#menu-panel').classList.add('hidden');
+  const r = await post('/api/control', { action: 'add_uniform' });
+  if (r.stats) { state.stats = r.stats; state.params = r.params; renderStatus(); syncControls(); }
+  tickFrame();
+};
+$('#mn-undo').onclick   = async () => { $('#menu-panel').classList.add('hidden');
+  await post('/api/undo'); tickFrame(); refreshState(); };
+$('#mn-clear').onclick  = async () => { $('#menu-panel').classList.add('hidden');
+  await post('/api/clear_paint'); tickFrame(); refreshState(); };
+$('#mn-snap').onclick   = async () => { $('#menu-panel').classList.add('hidden');
+  toast('rendering snapshot...');
+  const r = await post('/api/snapshot');
+  if (r.data_url) {
+    const a = document.createElement('a');
+    a.href = r.data_url;
+    a.download = `painter-${Date.now()}.png`;
+    document.body.appendChild(a); a.click(); a.remove();
+    toast(`snapshot: ${(r.bytes/1024).toFixed(0)} KB`);
+  } else toast(r.error || 'snapshot failed');
+};
+$('#mn-save').onclick   = async () => { $('#menu-panel').classList.add('hidden');
+  const r = await post('/api/save'); toast(r.error || 'saved');
 };
 
-// ------- controls panel -------
+function toast(msg) {
+  const t = $('#saved-toast'); if (!t) return;
+  t.textContent = msg;
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.textContent = '', 6000);
+}
+
+// ---------- controls panel: tabs + widget wiring ----------
 $$('.tab').forEach(t => t.onclick = () => {
   $$('.tab').forEach(x => x.classList.toggle('on', x === t));
   const key = t.dataset.tab;
   $$('.tabpane').forEach(p => p.classList.toggle('on', p.dataset.panel === key));
 });
-$$('.pctrl').forEach(el => {
-  const upd = () => {
-    const out = el.parentElement.querySelector('output');
-    if (out) out.textContent = fmt(Number(el.value));
-  };
-  el.addEventListener('input', upd);
-  el.addEventListener('change', () => {
-    const patch = {};
-    const v = Number(el.value);
-    patch[el.dataset.key] = v;
-    pushParams(patch);
-  });
-});
-// segmented pairs inside the panel (periodic, cooling)
-$$('.field .seg .seg-btn').forEach(b => {
-  b.addEventListener('click', () => {
-    const key = b.dataset.key; if (!key) return;
-    const val = Number(b.dataset.val) === 1;
-    const patch = {}; patch[key] = val;
-    pushParams(patch).then(syncControls);
-  });
-});
+buildFieldWidgets();
 
-// ------- New Canvas dialog -------
+// ---------- source tab actions ----------
+$('#upload-input').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const fd = new FormData(); fd.append('file', f);
+  const r = await fetch('/api/upload', { method: 'POST', body: fd }).then(r => r.json());
+  if (r.error) { toast(r.error); return; }
+  await loadImagesList();
+  await rebuildWithImage('upload:current');
+  toast(`uploaded ${r.bytes} bytes`);
+});
+$('#rebuild-btn').onclick = async () => {
+  await post('/api/init', state.params);
+  await refreshState(); tickFrame();
+};
+
+// ---------- new canvas dialog ----------
 function openNewDialog() {
   const dlg = $('#dlg-new');
   dlg.classList.remove('hidden');
-  // default to current
   const p = state.params;
   if (p) {
-    for (const b of $$('#dlg-new [data-res]')) {
-      b.classList.toggle('on', Number(b.dataset.res) === p.resolution);
-    }
+    // parse aspect from "blank:WxH" if present
+    const m = /^blank:(\d+)x(\d+)$/.exec(p.image || '');
+    if (m) { $('#new-w').value = m[1]; $('#new-h').value = m[2]; }
+    $('#new-res').value = p.resolution;
     $('#new-fill').value = p.fill;
     $('#new-fill-out').textContent = Number(p.fill).toFixed(2);
   }
 }
-$$('#dlg-new [data-res]').forEach(b => b.onclick = () => {
-  $$('#dlg-new [data-res]').forEach(x => x.classList.toggle('on', x === b));
-});
 $('#new-fill').oninput = e => {
   $('#new-fill-out').textContent = Number(e.target.value).toFixed(2);
 };
 $('#new-cancel').onclick = () => $('#dlg-new').classList.add('hidden');
 $('#new-ok').onclick = async () => {
-  const res = Number($$('#dlg-new [data-res].on')[0]?.dataset.res || 256);
-  const fill = Number($('#new-fill').value);
-  await api('/api/new_canvas', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      resolution: res, fill,
-      // carry the current physics forward so a New Canvas doesn't reset
-      // the artist's tuning
-      strength: state.params?.strength, screening: state.params?.screening,
-      cutoff: state.params?.cutoff, periodic: state.params?.periodic,
-      attract_depth: state.params?.attract_depth,
-      attract_range: state.params?.attract_range,
-      temperature: state.params?.temperature, cooling: state.params?.cooling,
-    }),
+  const w = Math.max(16, parseInt($('#new-w').value, 10) || 1920);
+  const h = Math.max(16, parseInt($('#new-h').value, 10) || 1080);
+  const res = Math.max(64, Math.min(4096, parseInt($('#new-res').value, 10) || 512));
+  const fill = Math.max(0, Math.min(1, parseFloat($('#new-fill').value)));
+  const upload = $('#new-upload').files[0];
+  let image = `blank:${w}x${h}`;
+  if (upload) {
+    const fd = new FormData(); fd.append('file', upload);
+    const r = await fetch('/api/upload', { method: 'POST', body: fd }).then(r => r.json());
+    if (!r.error) { image = 'upload:current'; await loadImagesList(); }
+  }
+  const carry = Object.assign({}, state.params || {}, {
+    image, resolution: res, fill,
+    line_density: image.startsWith('blank:') ? 0 : (state.params?.line_density ?? 1),
   });
+  await post('/api/init', carry);
   $('#dlg-new').classList.add('hidden');
   await refreshState();
+  tickFrame();
 };
 
-// close popovers on outside click
+// close popovers on outside pointerdown, but never inside a dialog
 document.addEventListener('pointerdown', ev => {
+  if (ev.target.closest('.overlay')) return;
   const inMenu = ev.target.closest('#menu-panel, #menu-btn');
   const inPanel = ev.target.closest('#panel, #panel-btn');
-  if (!inMenu) $('#menu-panel').classList.add('hidden');
-  if (!inPanel) $('#panel').classList.add('hidden');
+  const inLensP = ev.target.closest('#lens-panel, #lens-btn');
+  if (!inMenu)   $('#menu-panel').classList.add('hidden');
+  if (!inPanel)  $('#panel').classList.add('hidden');
+  if (!inLensP)  $('#lens-panel').classList.add('hidden');
 }, true);
 
-// initial load
-refreshState().then(() => {
-  // if canvas is at defaults and looks empty, show new-canvas dialog on first
-  // load so the user immediately picks resolution + fill
-  if (state.stats && state.stats.iteration === 0) openNewDialog();
-});
+// ---------- initial load ----------
+(async () => {
+  // Prime the frame src so no broken image icon appears while we bootstrap.
+  $('#frame').src = $('#frame-placeholder').src;
+  await refreshState();
+  await loadImagesList();
+  syncControls();
+  // If the canvas is fresh (iteration 0 AND blank source), invite New Canvas.
+  const s = state.stats;
+  const p = state.params;
+  if (s && s.iteration === 0 && p && p.image && p.image.startsWith('blank:')) {
+    openNewDialog();
+  }
+  tickFrame();
+})();

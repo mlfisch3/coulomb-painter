@@ -8,61 +8,100 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+
+  <!-- Blank 1x1 transparent PNG so the frame img never shows a broken icon
+       between page load and the first server frame. -->
+  <img id="frame-placeholder" alt=""
+       src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=">
+
   <header id="topbar">
-    <button id="menu-btn" class="tb" title="Canvas menu (new, reset)">&#9776;</button>
-    <div class="brand">Coulomb Painter</div>
+    <button id="menu-btn" class="tb" title="Canvas menu: new, reset, snapshot, save">&#9776;</button>
+    <div class="brand">Coulomb <span>Painter</span></div>
     <div class="spacer"></div>
-    <button id="pause-btn" class="tb" title="Pause or resume the annealer">Pause</button>
+    <button id="run-btn" class="tb primary" title="Anneal: run or pause the simulator">Anneal</button>
+    <button id="step-btn" class="tb" title="Step once, then hold">Step</button>
     <button id="freeze-btn" class="tb" title="Freeze mode: painting accumulates without the annealer stepping">Freeze</button>
-    <button id="live-btn" class="tb" title="Live view on / off. Off saves CPU on the display side; the simulation keeps running.">Live</button>
+    <button id="autoT-btn" class="tb" title="Probe uphill moves and set T for ~60% acceptance">Auto T</button>
+    <button id="lens-btn" class="tb" title="Toggle magnifier lens">Lens</button>
+    <span id="saved-toast" class="toast"></span>
   </header>
 
   <main id="stage">
     <div id="canvas-wrap">
       <img id="frame" alt="canvas frame">
-      <canvas id="ink"></canvas>
+      <canvas id="overlay"></canvas>
+      <div id="lens-wrap" class="hidden">
+        <img id="lens" alt="magnifier">
+        <div id="lens-label" class="lens-label"></div>
+      </div>
     </div>
   </main>
 
   <footer id="bottombar">
-    <div class="row">
+    <div class="row primary-row">
       <div class="seg" role="group" aria-label="Charge sign">
-        <button id="sign-plus" class="seg-btn on" title="Positive charge - repels the gas">&plus;</button>
+        <button id="sign-plus" class="seg-btn on" title="Positive charge - repels the gas">+</button>
         <button id="sign-minus" class="seg-btn" title="Negative charge - gathers the gas">&minus;</button>
       </div>
       <div class="seg" role="group" aria-label="Brush target">
-        <button id="target-fixed" class="seg-btn on" title="Paint pinned line-style charge">Fixed</button>
-        <button id="target-mobile" class="seg-btn" title="Paint placed mobile particles">Mobile</button>
+        <button id="target-fixed" class="seg-btn on" title="Paint pinned line-style fixed charge">Fixed</button>
+        <button id="target-mobile" class="seg-btn" title="Stamp mobile particles (adds on +, removes on -)">Mobile</button>
       </div>
-      <label class="thick" title="Brush thickness in lattice cells">
-        <input id="thickness" type="range" min="2" max="80" step="1" value="12">
-      </label>
-      <button id="panel-btn" class="tb wide" title="Open brush and physics controls">Controls</button>
+      <button id="paint-mode-btn" class="tb" title="Arm paint mode: drag on the view to paint">Paint</button>
+      <div class="thick" title="Brush thickness in lattice cells">
+        <span class="tlabel">T</span>
+        <input id="thickness" type="range" min="1" max="120" step="1" value="10">
+        <output id="thickness-out">10</output>
+      </div>
+      <button id="panel-btn" class="tb wide" title="Open the full controls panel">Controls</button>
     </div>
-    <div id="status" class="status" aria-live="polite"></div>
+    <div id="status" class="status" aria-live="polite">loading…</div>
   </footer>
 
-  <!-- New Canvas dialog -->
+  <!-- ---------- menu popover ---------- -->
+  <div id="menu-panel" class="popover hidden" role="menu">
+    <button id="mn-new" class="tb wide">New canvas...</button>
+    <button id="mn-reset" class="tb wide" title="Clear paint, reseed particles, keep drawing">Reset layout</button>
+    <button id="mn-add" class="tb wide" title="Re-seed the gas uniformly at the current fill, keeping paint">Add uniform charges</button>
+    <button id="mn-undo" class="tb wide" title="Undo the last stroke (charge and blocks)">Undo stroke</button>
+    <button id="mn-clear" class="tb wide" title="Drop the entire painted layer">Clear paint</button>
+    <button id="mn-snap" class="tb wide" title="Download a full-resolution PNG of the current frame">Snapshot</button>
+    <button id="mn-save" class="tb wide" title="Save state (.cmb) is deferred to a follow-up ship">Save state</button>
+  </div>
+
+  <!-- ---------- new canvas dialog ---------- -->
   <div id="dlg-new" class="overlay hidden" role="dialog" aria-modal="true"
        aria-labelledby="dlg-new-title">
     <div class="dialog">
       <h2 id="dlg-new-title">New canvas</h2>
       <label class="field">
-        <span>Resolution
-          <button class="qmark" title="Lattice edge in cells. Larger is prettier and slower.">?</button>
+        <span>Aspect
+          <button class="qmark" title="Canvas aspect ratio in raw pixels; the lattice below scales the long edge to `resolution`.">?</button>
         </span>
-        <div class="seg" role="group">
-          <button class="seg-btn on" data-res="256">256</button>
-          <button class="seg-btn" data-res="512">512</button>
-          <button class="seg-btn" data-res="1024">1024</button>
+        <div class="two-num">
+          <input id="new-w" type="number" min="16" step="1" value="1920">
+          <span>:</span>
+          <input id="new-h" type="number" min="16" step="1" value="1080">
         </div>
       </label>
       <label class="field">
-        <span>Initial fill
-          <button class="qmark" title="Fraction of sites seeded with mobile charge before the anneal starts.">?</button>
+        <span>Resolution (long edge, cells)
+          <button class="qmark" title="Long edge of the lattice in cells. 64 - 4096.">?</button>
         </span>
-        <input id="new-fill" type="range" min="0" max="0.7" step="0.01" value="0.30">
+        <input id="new-res" type="number" min="64" max="4096" step="16" value="512">
+      </label>
+      <label class="field">
+        <span>Initial mobile fill
+          <button class="qmark" title="Fraction of free sites seeded with mobile charge before the anneal starts.">?</button>
+        </span>
+        <input id="new-fill" type="range" min="0" max="0.9" step="0.01" value="0.30">
         <output id="new-fill-out">0.30</output>
+      </label>
+      <label class="field">
+        <span>Upload drawing (optional)
+          <button class="qmark" title="Load an image whose dark pixels become fixed line charges.">?</button>
+        </span>
+        <input id="new-upload" type="file" accept="image/*">
       </label>
       <div class="dialog-actions">
         <button id="new-cancel" class="tb">Cancel</button>
@@ -71,148 +110,223 @@
     </div>
   </div>
 
-  <!-- Menu -->
-  <div id="menu-panel" class="popover hidden" role="menu">
-    <button id="mn-new" class="tb wide">New canvas...</button>
-    <button id="mn-reset" class="tb wide" title="Return to the state the New Canvas dialog left it in">Reset canvas</button>
-  </div>
-
-  <!-- Controls panel with tabs -->
+  <!-- ---------- controls panel (tabs) ---------- -->
   <div id="panel" class="panel hidden" role="dialog" aria-modal="false"
        aria-labelledby="panel-title">
     <div class="panel-head">
       <h3 id="panel-title">Controls</h3>
-      <div class="tabs">
-        <button class="tab on" data-tab="brush">Brush</button>
-        <button class="tab" data-tab="physics">Physics</button>
-        <button class="tab" data-tab="anneal">Anneal</button>
-      </div>
       <button id="panel-close" class="tb" aria-label="Close">&times;</button>
     </div>
+    <div class="tabs">
+      <button class="tab on" data-tab="brush">Brush</button>
+      <button class="tab" data-tab="heat">Heat</button>
+      <button class="tab" data-tab="anneal">Anneal</button>
+      <button class="tab" data-tab="physics">Physics</button>
+      <button class="tab" data-tab="source">Source</button>
+      <button class="tab" data-tab="compute">Compute</button>
+      <button class="tab" data-tab="display">Display</button>
+    </div>
     <div class="panel-body">
+
       <section data-panel="brush" class="tabpane on">
-        <label class="field">
-          <span>Magnitude
-            <button class="qmark" title="Peak charge density of one fast pass. Scale: 1 is 'as strong as a fully inked line'.">?</button>
-          </span>
-          <input class="pctrl" type="range" data-key="brush_magnitude"
-                 min="0.1" max="8" step="0.1" value="3">
-          <output></output>
-        </label>
-        <label class="field">
-          <span>Hardness
-            <button class="qmark" title="Radial profile plateau fraction. 1 hard edge, 0 pure cosine bump.">?</button>
-          </span>
-          <input class="pctrl" type="range" data-key="brush_hardness"
-                 min="0" max="1" step="0.05" value="0.5">
-          <output></output>
-        </label>
-        <label class="field">
-          <span>Flow
-            <button class="qmark" title="Charge laid per cell of travel. Dwelling still keeps depositing.">?</button>
-          </span>
-          <input class="pctrl" type="range" data-key="brush_flow"
-                 min="0.1" max="4" step="0.1" value="1">
-          <output></output>
-        </label>
-        <label class="field">
-          <span>Density
-            <button class="qmark" title="Charge laid per unit area. Multiplies with magnitude and flow.">?</button>
-          </span>
-          <input class="pctrl" type="range" data-key="brush_density"
-                 min="0.1" max="4" step="0.1" value="1">
-          <output></output>
-        </label>
-        <label class="field">
-          <span>Coupling radius
-            <button class="qmark" title="How far painted fixed charge is felt at all. Mobile brush ignores this.">?</button>
-          </span>
-          <input class="pctrl" type="range" data-key="brush_coupling"
-                 min="2" max="40" step="1" value="10">
-          <output></output>
-        </label>
+        <div class="field-num" data-key="brush_magnitude" data-min="0" data-step="0.5"
+             title="Peak charge density of one fast pass. 1 is 'as strong as a fully inked line'.">
+          <span>magnitude</span></div>
+        <div class="field-num" data-key="brush_density" data-min="0" data-step="0.1"
+             title="Charge laid per unit area.">
+          <span>density</span></div>
+        <div class="field-num" data-key="brush_flow" data-min="0" data-step="0.1"
+             title="Charge laid per cell of travel. Dwelling keeps depositing.">
+          <span>flow</span></div>
+        <div class="field-num" data-key="brush_hardness" data-min="0" data-max="1" data-step="0.05"
+             title="Radial profile plateau fraction: 1 hard edge, 0 pure cosine.">
+          <span>hardness</span></div>
+        <div class="field-num" data-key="brush_penetrability" data-min="0" data-max="1" data-step="0.05"
+             title="1 = paint never blocks; 0 = blocks everywhere the brush touched.">
+          <span>penetrability</span></div>
+        <div class="field-num" data-key="brush_coupling" data-min="1" data-max="60" data-step="1"
+             title="Radius over which painted fixed charge is felt at all.">
+          <span>coupling radius</span></div>
+        <div class="field-num" data-key="brush_budget" data-min="0" data-step="10"
+             title="Move attempts per painted cell after a stroke.">
+          <span>budget</span></div>
+        <div class="field-num" data-key="brush_pulse" data-min="0.01" data-step="0.25"
+             title="Temperature multiplier at the start of the per-stroke relax.">
+          <span>heat pulse</span></div>
+        <div class="field-num" data-key="brush_ms" data-min="0" data-max="1000" data-step="10"
+             title="Wall-clock ceiling per paint packet, ms.">
+          <span>relax ceiling (ms)</span></div>
+        <div class="field-bool" data-key="show_paint"
+             title="Show the painted-charge overlay on the frame.">
+          <span>show painted charge</span></div>
+        <div class="row-actions">
+          <button id="btn-undo" class="tb" title="Undo the last stroke (charge and blocks)">Undo stroke</button>
+          <button id="btn-clear" class="tb" title="Drop the entire painted layer">Clear paint</button>
+        </div>
       </section>
 
-      <section data-panel="physics" class="tabpane">
-        <label class="field">
-          <span>Coulomb strength
-            <button class="qmark" title="Prefactor of the 1/r repulsion.">?</button>
-          </span>
-          <input class="pctrl" type="range" data-key="strength"
-                 min="0.1" max="5" step="0.1" value="1">
-          <output></output>
-        </label>
-        <label class="field">
-          <span>Well depth
-            <button class="qmark" title="Short-range attractive well depth at r=0, mobile-mobile only.">?</button>
-          </span>
-          <input class="pctrl" type="range" data-key="attract_depth"
-                 min="0" max="4" step="0.05" value="0">
-          <output></output>
-        </label>
-        <label class="field">
-          <span>Well range
-            <button class="qmark" title="Decay length of the attractive well, in lattice cells.">?</button>
-          </span>
-          <input class="pctrl" type="range" data-key="attract_range"
-                 min="0.5" max="6" step="0.1" value="1.5">
-          <output></output>
-        </label>
-        <label class="field">
-          <span>Cutoff
-            <button class="qmark" title="Interaction cutoff radius in lattice cells. Applies to both terms.">?</button>
-          </span>
-          <input class="pctrl" type="range" data-key="cutoff"
-                 min="4" max="24" step="1" value="8">
-          <output></output>
-        </label>
-        <label class="field">
-          <span>Boundary
-            <button class="qmark" title="Hard wall confines particles; periodic wraps them.">?</button>
-          </span>
-          <div class="seg" role="group">
-            <button class="seg-btn on" data-key="periodic" data-val="0">Wall</button>
-            <button class="seg-btn" data-key="periodic" data-val="1">Periodic</button>
-          </div>
-        </label>
+      <section data-panel="heat" class="tabpane">
+        <div class="note">Temperature brush: paint an isolated subsystem at its own absolute temperature. Requires the GPU backend, which is not wired up in the MVP - the controls exist so their values persist, but the effect does not apply yet.</div>
+        <div class="field-num" data-key="heat_temperature" data-min="0" data-step="100"
+             title="Absolute Kelvin under the brush.">
+          <span>brush temperature (K)</span></div>
+        <div class="field-num" data-key="heat_radius" data-min="2" data-step="1"
+             title="Radius of the isolated subsystem, cells.">
+          <span>radius</span></div>
+        <div class="field-num" data-key="heat_hardness" data-min="0" data-max="1" data-step="0.05"
+             title="Contact-disc hardness: 1 hard edge, 0 soft.">
+          <span>hardness</span></div>
+        <div class="field-num" data-key="heat_wake" data-min="0" data-max="24" data-step="1"
+             title="Trailing patches tracked at once. 0 tears the effect down instantly.">
+          <span>wake regions</span></div>
+        <div class="field-num" data-key="heat_wake_rate" data-min="0" data-max="1" data-step="0.01"
+             title="Fraction of the remaining gap to ambient closed per tick.">
+          <span>wake relax rate</span></div>
       </section>
 
       <section data-panel="anneal" class="tabpane">
-        <label class="field">
-          <span>Temperature
-            <button class="qmark" title="Kelvin. Higher temperature accepts more uphill moves.">?</button>
-          </span>
-          <input class="pctrl" type="range" data-key="temperature"
-                 min="100" max="20000" step="100" value="4000">
-          <output></output>
-        </label>
-        <label class="field">
-          <span>Cooling
-            <button class="qmark" title="Whether the temperature schedule is decreasing.">?</button>
-          </span>
-          <div class="seg" role="group">
-            <button class="seg-btn on" data-key="cooling" data-val="0">Off</button>
-            <button class="seg-btn" data-key="cooling" data-val="1">On</button>
-          </div>
-        </label>
-        <label class="field">
-          <span>Batch size
-            <button class="qmark" title="Particles proposed per iteration. Bigger batches move faster in the mean, at higher rejection.">?</button>
-          </span>
-          <input class="pctrl" type="range" data-key="batch"
-                 min="1" max="256" step="1" value="48">
-          <output></output>
-        </label>
-        <label class="field">
-          <span>Max hop
-            <button class="qmark" title="Maximum displacement per proposal, in cells.">?</button>
-          </span>
-          <input class="pctrl" type="range" data-key="step_size"
-                 min="1" max="8" step="1" value="2">
-          <output></output>
-        </label>
+        <div class="field-num" data-key="temperature" data-min="0" data-step="100"
+             title="Kelvin.">
+          <span>temperature (K)</span></div>
+        <div class="field-bool" data-key="cooling"
+             title="Is the temperature schedule decreasing.">
+          <span>cooling active</span></div>
+        <div class="field-bool" data-key="auto_cools"
+             title="Auto temperature also arms cooling.">
+          <span>auto temp starts cooling</span></div>
+        <div class="field-sel" data-key="schedule"
+             data-opts="geometric,cosine"
+             title="geometric: pure decay. cosine: decay with a warming cycle on top.">
+          <span>schedule</span></div>
+        <div class="field-num" data-key="reheat_amp" data-min="0" data-step="0.1"
+             title="Cosine peak, multiple of baseline.">
+          <span>reheat amp</span></div>
+        <div class="field-num" data-key="reheat_period" data-min="100" data-step="1000"
+             title="Iterations per warming cycle.">
+          <span>reheat period</span></div>
+        <div class="field-num" data-key="reheat_decay" data-min="0.5" data-max="1" data-step="0.01"
+             title="Amp multiplier per 1000 iterations.">
+          <span>reheat decay / 1k</span></div>
+        <div class="field-num" data-key="cooling_rate" data-min="0.5" data-max="1" data-step="0.005"
+             title="Temperature multiplier per 1000 iterations.">
+          <span>cooling rate / 1k</span></div>
+        <div class="field-num" data-key="batch" data-min="1" data-step="1"
+             title="Particles proposed per iteration.">
+          <span>particles / iter</span></div>
+        <div class="field-num" data-key="batch_min" data-min="1" data-step="1"
+             title="Batch floor after auto-decrement.">
+          <span>min batch</span></div>
+        <div class="field-num" data-key="batch_decrement" data-min="1" data-step="1"
+             title="How much the batch shrinks per streak.">
+          <span>batch decrement</span></div>
+        <div class="field-num" data-key="fail_limit" data-min="1" data-step="1"
+             title="Dead proposals in a row before batch shrinks.">
+          <span>dead proposals threshold</span></div>
+        <div class="field-num" data-key="step_size" data-min="1" data-max="12" data-step="1"
+             title="Max displacement per proposal.">
+          <span>max hop</span></div>
       </section>
+
+      <section data-panel="physics" class="tabpane">
+        <div class="field-num" data-key="strength" data-min="0" data-step="0.01"
+             title="Prefactor of the 1/r Coulomb term.">
+          <span>Coulomb strength</span></div>
+        <div class="field-num" data-key="screening" data-min="0" data-step="0.01"
+             title="exp(-r/L)/r envelope. 0 disables screening.">
+          <span>screening length</span></div>
+        <div class="field-num" data-key="cutoff" data-min="1" data-max="40" data-step="1"
+             title="Interaction cutoff radius in cells.">
+          <span>cutoff radius</span></div>
+        <div class="field-bool" data-key="periodic"
+             title="On = wrap around, off = hard wall.">
+          <span>periodic boundary</span></div>
+        <div class="field-num" data-key="attract_depth" data-min="0" data-step="0.01"
+             title="Short-range attraction well depth at r=0 (mobile-mobile only).">
+          <span>well depth</span></div>
+        <div class="field-num" data-key="attract_range" data-min="0.1" data-step="0.01"
+             title="Decay length of the attraction well, cells.">
+          <span>well range</span></div>
+        <div class="field-num" data-key="charge" data-step="0.01"
+             title="Charge per mobile particle.">
+          <span>charge / particle</span></div>
+      </section>
+
+      <section data-panel="source" class="tabpane">
+        <div class="field-sel" data-key="image"
+             data-opts=""
+             title="Blank canvases and the current upload.">
+          <span>image</span></div>
+        <div class="row-actions">
+          <label class="upload-inline">
+            Upload…
+            <input id="upload-input" type="file" accept="image/*" hidden>
+          </label>
+          <button id="rebuild-btn" class="tb" title="Rebuild the lattice with the current image, resolution, and fill.">Build / reload</button>
+        </div>
+        <div class="field-num" data-key="line_density" data-step="0.25"
+             title="Charge per unit line coverage from the drawing.">
+          <span>line charge density</span></div>
+        <div class="field-bool" data-key="line_blocks"
+             title="Lines exclude mobile charge from those cells.">
+          <span>lines block particles</span></div>
+        <div class="field-num" data-key="line_threshold" data-min="0" data-max="1" data-step="0.05"
+             title="Coverage above this blocks a site.">
+          <span>line threshold</span></div>
+        <div class="field-num" data-key="fill" data-min="0" data-max="1" data-step="0.05"
+             title="Initial mobile fill fraction. Applies on Build / Reset.">
+          <span>initial fill</span></div>
+      </section>
+
+      <section data-panel="compute" class="tabpane">
+        <div class="note" id="backend-note">CPU backend only in the MVP; GPU/tile knobs persist but do not apply.</div>
+        <div class="field-sel" data-key="backend"
+             data-opts="cpu,gpu"
+             title="cpu: numpy/scipy batch Metropolis. gpu: tiled CUDA (not yet wired in).">
+          <span>backend</span></div>
+        <div class="field-num" data-key="moves_per_tile" data-min="1" data-max="4096" data-step="16"
+             title="GPU-only: sequential moves each tile runs per launch.">
+          <span>moves per tile / launch</span></div>
+        <div class="field-num" data-key="tile" data-min="0" data-max="128" data-step="4"
+             title="GPU-only: tile edge in cells. 0 picks the smallest legal one.">
+          <span>tile edge (0 = auto)</span></div>
+      </section>
+
+      <section data-panel="display" class="tabpane">
+        <div class="field-bool" data-key="live_view"
+             title="Turn off to save CPU on rendering; the sim keeps running.">
+          <span>live view</span></div>
+        <div class="field-sel" data-key="palette"
+             data-opts="vivid,true"
+             title="vivid: best looking. true: rises monotonically in luminance.">
+          <span>palette</span></div>
+        <div class="field-sel" data-key="color_mode"
+             data-opts="density,gray,flat"
+             title="How occupancy is coloured on the frame.">
+          <span>colour mode</span></div>
+        <div class="field-bool" data-key="show_edges"
+             title="Overlay the drawing's line charges on the frame.">
+          <span>show line charges</span></div>
+        <div class="field-num" data-key="smooth" data-min="0" data-max="4" data-step="0.2"
+             title="Reconstruction filter width. 0 = raw pixels.">
+          <span>smoothing</span></div>
+        <div class="field-num" data-key="display_px" data-min="400" data-max="2400" data-step="100"
+             title="Longest edge of the streamed frame in pixels.">
+          <span>display size (px)</span></div>
+      </section>
+
     </div>
+  </div>
+
+  <!-- ---------- lens controls popover ---------- -->
+  <div id="lens-panel" class="popover hidden right" role="menu">
+    <div class="field-bool" data-key="lens_on" data-local="1" title="Show or hide the magnifier lens overlay.">
+      <span>lens on</span>
+    </div>
+    <div class="field-num" data-key="lens_span" data-local="1" data-min="16" data-max="1024" data-step="16"
+         title="Lattice cells shown across the lens (1:1, no averaging).">
+      <span>lens span (cells)</span>
+    </div>
+    <div class="note">Tap the frame to pin the lens; tap again to release.</div>
   </div>
 
   <script src="app.js"></script>

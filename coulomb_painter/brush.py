@@ -34,7 +34,11 @@ class Brush:
     thickness: float = 8.0       # stroke width, full width
     flow: float = 1.0            # charge laid per cell of travel
     hardness: float = 0.5        # plateau fraction; 1 = hard edge, 0 = all falloff
+    penetrability: float = 1.0   # 1 = paint never blocks, 0 = blocks wherever it lands
     coupling: float = 12.0       # radius over which painted charge is felt at all
+    budget: float = 60.0         # move attempts per painted cell after a stroke
+    pulse: float = 2.0           # temperature multiplier at the start of the relax
+    ms: float = 40.0             # wall-clock ceiling on the relax, milliseconds
     target: str = "fixed"        # "fixed" or "mobile"
 
     @classmethod
@@ -46,7 +50,11 @@ class Brush:
             thickness=float(getattr(p, "brush_thickness", 8.0)),
             flow=float(getattr(p, "brush_flow", 1.0)),
             hardness=float(getattr(p, "brush_hardness", 0.5)),
+            penetrability=float(getattr(p, "brush_penetrability", 1.0)),
             coupling=float(getattr(p, "brush_coupling", 12.0)),
+            budget=float(getattr(p, "brush_budget", 60.0)),
+            pulse=float(getattr(p, "brush_pulse", 2.0)),
+            ms=float(getattr(p, "brush_ms", 40.0)),
             target=str(getattr(p, "brush_target", "fixed")))
         for k, v in (override or {}).items():
             if not hasattr(b, k):
@@ -62,6 +70,7 @@ class Brush:
         b.thickness = max(1.0, b.thickness)
         b.coupling = max(1.0, b.coupling)
         b.hardness = min(max(b.hardness, 0.0), 1.0)
+        b.penetrability = min(max(b.penetrability, 0.0), 1.0)
         b.target = "mobile" if b.target == "mobile" else "fixed"
         return b
 

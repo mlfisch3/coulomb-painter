@@ -56,8 +56,31 @@ def test_paint_mobile_removes_particles():
 def test_render_png_shape():
     p = sim.Params(resolution=64, fill=0.3)
     s = sim.CoulombSim(p, seed=3)
-    png = render.render_png(s.occ, s.paint, max_px=200)
+    png = render.render_png(s.occ, s.paint, s.cov, max_px=200)
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_undo_stroke_restores_state():
+    p = sim.Params(resolution=96, fill=0.20)
+    s = sim.CoulombSim(p, seed=5)
+    paint_before = s.paint.sum()
+    n_before = s.n
+    br = brush.Brush.from_params(p, override={"target": "fixed",
+                                              "magnitude": 4.0,
+                                              "thickness": 8.0})
+    s.paint_stroke([(40.0, 40.0), (60.0, 60.0)], br, first=True, last=True)
+    assert s.paint.sum() != paint_before
+    assert s.undo_stroke()
+    # undo restores fixed-charge to zero (or its prior value)
+    assert abs(s.paint.sum() - paint_before) < 1e-6
+    # mobile paint undo path
+    br2 = brush.Brush.from_params(p, override={"target": "mobile",
+                                               "sign": -1.0,
+                                               "thickness": 12.0})
+    info = s.paint_stroke([(50.0, 50.0)], br2, first=True, last=True)
+    assert info["removed"] > 0
+    assert s.undo_stroke()
+    assert s.n == n_before
 
 
 def test_flask_endpoints():
@@ -69,16 +92,31 @@ def test_flask_endpoints():
     # state
     j = app.get("/api/state").get_json()
     assert "params" in j and "stats" in j
-    # new canvas
-    r = app.post("/api/new_canvas", json={"resolution": 128, "fill": 0.2})
+    # new canvas via /api/init (full rebuild)
+    r = app.post("/api/init", json={"image": "blank:128x128",
+                                    "resolution": 128, "fill": 0.2})
     j = r.get_json()
     assert j["ok"] and j["stats"]["lattice"] == [128, 128]
     # paint
     r = app.post("/api/paint", json={"points": [[50, 50], [60, 60]],
                                      "first": True, "last": True})
     assert r.get_json()["ok"]
-    # reset
-    assert app.post("/api/reset").get_json()["ok"]
+    # reset via /api/control
+    assert app.post("/api/control", json={"action": "reset"}).get_json()["ok"]
+    # live update
+    r = app.post("/api/update", json={"temperature": 3500,
+                                       "brush_sign": -1})
+    assert r.get_json()["ok"]
+    # undo (no strokes: still ok)
+    assert app.post("/api/undo").get_json()["ok"]
+    # clear paint
+    assert app.post("/api/clear_paint").get_json()["ok"]
+    # zoom
+    r = app.get("/api/zoom.png?cx=64&cy=64&span=32&out=128")
+    assert r.status_code == 200 and r.data[:8] == b"\x89PNG\r\n\x1a\n"
+    # images list
+    lst = app.get("/api/images").get_json()
+    assert isinstance(lst, list) and any(s.startswith("blank:") for s in lst)
     # frame
     r = app.get("/api/frame.png")
     assert r.status_code == 200
