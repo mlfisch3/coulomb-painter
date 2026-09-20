@@ -19,8 +19,8 @@
   "chains": 4,
   "gpu_chains": 4,
   "gpu_moves_per_tile": 32,
-  "accept_tol": 0.02,
-  "energy_tol": 0.02,
+  "accept_tol": 0.01,
+  "energy_tol": 0.01,
   "stages": [
     {
       "temperature": 50000.0,
