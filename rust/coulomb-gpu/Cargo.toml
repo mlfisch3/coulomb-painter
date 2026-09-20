@@ -1,0 +1,17 @@
+[package]
+name = "coulomb-gpu"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "wgpu port of the coulomb-core physics kernel (M2). Tiled 2x2 coloured Metropolis in WGSL."
+
+[dependencies]
+coulomb-core = { path = "../coulomb-core" }
+wgpu = { version = "0.19", default-features = false, features = ["wgsl"] }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.3"
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+rand_pcg = "0.3"
+thiserror = "1"

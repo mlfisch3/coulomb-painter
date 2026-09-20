@@ -18,9 +18,13 @@ Do not edit that reference from this repository; it is read-only for us.
 
 ## Validation approach
 
-Between engines with independent RNG streams (Rust `Pcg64Mcg` versus numpy PCG64), single-snapshot energy has O(sqrt(N)*kB*T) thermal noise that swamps any 1% comparison at hot temperature.
+Between engines with independent RNG streams (Rust `Pcg64Mcg`, numpy PCG64, WGSL xorshift), single-snapshot energy has O(sqrt(N)*kB*T) thermal noise that swamps any 1% comparison at hot temperature.
 The `rust/coulomb-validate` binary therefore compares single-move acceptance rate and the mean of the running energy sampled across the second half of the run, averaged over independent chains.
 Particle count is checked for exact equality (charge is conserved by construction).
+
+`T*_gpu.json` scenarios exercise the third engine (`coulomb-gpu`) alongside the CPU and Python references and pairwise-compare all three.
+On a machine without a real GPU, install Mesa Lavapipe and pin the ICD via `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`.
+`coulomb-gpu`'s own README covers the WGSL kernel structure, the `u_edge` upload contract, and the `WGPU_BACKEND` / `WGPU_ADAPTER_NAME` env overrides.
 
 ## Maintaining this file
 
