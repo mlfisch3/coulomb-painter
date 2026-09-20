@@ -1136,6 +1136,13 @@ impl Sim {
     pub fn u_edge(&self) -> &[f64] {
         &self.u_edge
     }
+
+    /// Composite blocked-site mask (line-charge coverage above threshold OR
+    /// painted-block flag). Additive accessor for M2's GPU wrapper, which
+    /// needs to upload the same mask the CPU sim built during `new`.
+    pub fn blocked(&self) -> &[bool] {
+        &self.blocked
+    }
 }
 
 #[derive(Debug, Clone, Default)]

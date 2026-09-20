@@ -1,11 +1,11 @@
 [package]
-name = "coulomb-validate"
+name = "coulomb-bench"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Runs a scenario through coulomb-core and the Python reference, compares acceptance, energy, and particle count."
+description = "Local benchmark of the coulomb-gpu WGSL kernel. Prints MPS, adapter, memory, and JSON summary."
 
 [dependencies]
 coulomb-core = { path = "../coulomb-core" }

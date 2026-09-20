@@ -6,6 +6,7 @@
 // Exit non-zero on any comparison outside tolerance.
 
 use coulomb_core::{Brush, Params, Sim};
+use coulomb_gpu::GpuSim;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::Write;
@@ -97,7 +98,15 @@ struct Scenario {
     /// carry its full thermal fluctuation.
     #[serde(default = "one_us")]
     chains: usize,
+    /// GPU chain count (independent seeds). 0 disables the GPU comparison.
+    #[serde(default)]
+    gpu_chains: usize,
+    /// Moves per tile per GPU sweep dispatch. 32 is a reasonable default for
+    /// lavapipe validation; discrete adapters saturate the tile better at 64+.
+    #[serde(default = "thirtytwo_u32")]
+    gpu_moves_per_tile: u32,
 }
+fn thirtytwo_u32() -> u32 { 32 }
 fn sixtyfour() -> usize { 64 }
 fn one_us() -> usize { 1 }
 fn twelve_us() -> usize { 12 }
@@ -245,6 +254,109 @@ fn run_rust(sc: &Scenario) -> RunResult {
     RunResult { stages, final_energy, final_particles }
 }
 
+fn run_gpu(sc: &Scenario) -> Result<RunResult, String> {
+    let chains = sc.gpu_chains.max(1);
+    let mut stages_agg: Vec<Vec<StageResult>> = (0..sc.stages.len()).map(|_| Vec::new()).collect();
+    let mut final_particles = 0usize;
+    let mut final_energy = 0.0f64;
+    for chain in 0..chains {
+        let seed = sc.seed.wrapping_add(chain as u64 * 997);
+        let params = Params {
+            h: sc.h,
+            w: sc.w,
+            seed,
+            strength: sc.strength,
+            screening: sc.screening,
+            cutoff: sc.cutoff,
+            periodic: sc.periodic,
+            charge: sc.charge,
+            attract_depth: sc.attract_depth,
+            attract_range: sc.attract_range,
+            temperature: sc.stages.first().map(|s| s.temperature).unwrap_or(5000.0),
+            batch: sc.batch,
+            batch_min: sc.batch_min,
+            batch_decrement: sc.batch_decrement,
+            fail_limit: sc.fail_limit,
+            step_size: sc.step_size,
+        };
+        let mut sim = GpuSim::new_blank(params, sc.particles).map_err(|e| e.to_string())?;
+        // Stroke playback is deliberately skipped for the GPU path in M2 - the
+        // brush's u_edge patching lives in coulomb-core, and porting it to
+        // wgpu is M5 territory. Scenarios flagged with gpu_chains > 0 must
+        // therefore be paint-free for the physics-parity comparison to mean
+        // anything (running the CPU with strokes vs the GPU without would be
+        // comparing different Hamiltonians).
+        let mut prev_att: u64 = 0;
+        let mut prev_acc: u64 = 0;
+        for (i, st) in sc.stages.iter().enumerate() {
+            if st.strokes.iter().any(|s| !s.is_empty()) {
+                return Err(format!(
+                    "stage {} has paint strokes but the GPU path does not yet\n\
+                     implement brush u_edge patching (M5). Remove strokes from\n\
+                     the GPU scenario or use the CPU-only scenario file.",
+                    i
+                ));
+            }
+            sim.set_temperature(st.temperature);
+            let mut history: Vec<f64> = Vec::new();
+            let mut attempts: u64 = 0;
+            while attempts < st.iterations {
+                let a = sim.sweep(st.temperature, sc.gpu_moves_per_tile);
+                attempts += a;
+                history.push(sim.energy());
+            }
+            let tail: &[f64] = &history[history.len() / 2..];
+            let energy_mean_tail = if tail.is_empty() {
+                sim.energy()
+            } else {
+                tail.iter().sum::<f64>() / tail.len() as f64
+            };
+            let s = sim.stats();
+            let dp = s.proposed.saturating_sub(prev_att);
+            let da = s.accepted.saturating_sub(prev_acc);
+            stages_agg[i].push(StageResult {
+                stage: i,
+                temperature: st.temperature,
+                iterations: st.iterations,
+                proposed: dp,
+                accepted: da,
+                acceptance: if dp == 0 { 0.0 } else { da as f64 / dp as f64 },
+                energy: s.energy,
+                energy_mean_tail,
+                particles: s.particles,
+            });
+            prev_att = s.proposed;
+            prev_acc = s.accepted;
+        }
+        let s = sim.stats();
+        final_energy = s.energy;
+        final_particles = s.particles;
+    }
+    let stages: Vec<StageResult> = stages_agg
+        .iter()
+        .enumerate()
+        .map(|(i, per_chain)| {
+            let n = per_chain.len() as u64;
+            let sum_prop: u64 = per_chain.iter().map(|r| r.proposed).sum();
+            let sum_acc: u64 = per_chain.iter().map(|r| r.accepted).sum();
+            let mean_e: f64 = per_chain.iter().map(|r| r.energy_mean_tail).sum::<f64>() / n as f64;
+            let snapshot_e: f64 = per_chain.iter().map(|r| r.energy).sum::<f64>() / n as f64;
+            StageResult {
+                stage: i,
+                temperature: per_chain[0].temperature,
+                iterations: per_chain[0].iterations,
+                proposed: sum_prop,
+                accepted: sum_acc,
+                acceptance: if sum_prop == 0 { 0.0 } else { sum_acc as f64 / sum_prop as f64 },
+                energy: snapshot_e,
+                energy_mean_tail: mean_e,
+                particles: per_chain[0].particles,
+            }
+        })
+        .collect();
+    Ok(RunResult { stages, final_energy, final_particles })
+}
+
 fn run_python(scenario_path: &PathBuf) -> Result<RunResult, String> {
     // The Python driver sits next to `main.rs` in the repo tree, and is
     // deliberately kept small and Cargo-invocation-agnostic. It only imports
@@ -273,49 +385,46 @@ fn run_python(scenario_path: &PathBuf) -> Result<RunResult, String> {
     Ok(out)
 }
 
-fn compare(sc: &Scenario, rust: &RunResult, py: &RunResult) -> Vec<String> {
+fn compare_pair(sc: &Scenario, a: &RunResult, b: &RunResult, la: &str, lb: &str) -> Vec<String> {
     let mut fails = Vec::new();
-    if rust.stages.len() != py.stages.len() {
+    if a.stages.len() != b.stages.len() {
         fails.push(format!(
-            "stage count mismatch: rust {} py {}",
-            rust.stages.len(),
-            py.stages.len()
+            "[{} vs {}] stage count mismatch: {} vs {}",
+            la, lb, a.stages.len(), b.stages.len()
         ));
         return fails;
     }
-    for i in 0..rust.stages.len() {
-        let r = &rust.stages[i];
-        let p = &py.stages[i];
-        let da = (r.acceptance - p.acceptance).abs();
-        // For very low acceptance stages (~0), an "absolute 1%" bound is the
-        // right one; anywhere else the 1% relative bound sees more signal.
+    for i in 0..a.stages.len() {
+        let ra = &a.stages[i];
+        let rb = &b.stages[i];
+        let da = (ra.acceptance - rb.acceptance).abs();
         let acc_ok = da <= sc.accept_tol
-            || (p.acceptance > 0.0 && da / p.acceptance <= sc.accept_tol);
+            || (rb.acceptance > 0.0 && da / rb.acceptance <= sc.accept_tol);
         if !acc_ok {
             fails.push(format!(
-                "stage {} acceptance mismatch: rust {:.4} py {:.4} (dA {:.4})",
-                i, r.acceptance, p.acceptance, da
+                "[{} vs {}] stage {} acceptance mismatch: {:.4} vs {:.4} (dA {:.4})",
+                la, lb, i, ra.acceptance, rb.acceptance, da
             ));
         }
-        let denom = p.energy_mean_tail.abs().max(1e-30);
-        let de_rel = (r.energy_mean_tail - p.energy_mean_tail).abs() / denom;
+        let denom = rb.energy_mean_tail.abs().max(1e-30);
+        let de_rel = (ra.energy_mean_tail - rb.energy_mean_tail).abs() / denom;
         if de_rel > sc.energy_tol {
             fails.push(format!(
-                "stage {} energy_mean_tail mismatch: rust {:.6e} py {:.6e} (rel {:.4})",
-                i, r.energy_mean_tail, p.energy_mean_tail, de_rel
+                "[{} vs {}] stage {} energy_mean_tail mismatch: {:.6e} vs {:.6e} (rel {:.4})",
+                la, lb, i, ra.energy_mean_tail, rb.energy_mean_tail, de_rel
             ));
         }
-        if r.particles != p.particles {
+        if ra.particles != rb.particles {
             fails.push(format!(
-                "stage {} particle count mismatch: rust {} py {}",
-                i, r.particles, p.particles
+                "[{} vs {}] stage {} particle count mismatch: {} vs {}",
+                la, lb, i, ra.particles, rb.particles
             ));
         }
     }
-    if rust.final_particles != py.final_particles {
+    if a.final_particles != b.final_particles {
         fails.push(format!(
-            "final particle count mismatch: rust {} py {}",
-            rust.final_particles, py.final_particles
+            "[{} vs {}] final particle count mismatch: {} vs {}",
+            la, lb, a.final_particles, b.final_particles
         ));
     }
     fails
@@ -340,21 +449,56 @@ fn main() {
             std::process::exit(3);
         }
     };
+    let gpu = if sc.gpu_chains > 0 {
+        match run_gpu(&sc) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("gpu run failed: {}", e);
+                std::process::exit(4);
+            }
+        }
+    } else {
+        None
+    };
+
     println!("stage-by-stage comparison:");
-    println!(
-        "{:>5} {:>10} {:>10} {:>10} {:>14} {:>14}",
-        "stage", "T (K)", "acc rust", "acc py", "<E> rust (eV)", "<E> py (eV)"
-    );
-    for i in 0..rust.stages.len() {
-        let r = &rust.stages[i];
-        let p = &py.stages[i];
+    if gpu.is_some() {
         println!(
-            "{:>5} {:>10.1} {:>10.4} {:>10.4} {:>14.4e} {:>14.4e}",
-            i, r.temperature, r.acceptance, p.acceptance,
-            r.energy_mean_tail, p.energy_mean_tail
+            "{:>5} {:>10} {:>8} {:>8} {:>8} {:>13} {:>13} {:>13}",
+            "stage", "T (K)", "acc cpu", "acc gpu", "acc py",
+            "<E> cpu", "<E> gpu", "<E> py"
         );
+        for i in 0..rust.stages.len() {
+            let r = &rust.stages[i];
+            let p = &py.stages[i];
+            let g = &gpu.as_ref().unwrap().stages[i];
+            println!(
+                "{:>5} {:>10.1} {:>8.4} {:>8.4} {:>8.4} {:>13.4e} {:>13.4e} {:>13.4e}",
+                i, r.temperature, r.acceptance, g.acceptance, p.acceptance,
+                r.energy_mean_tail, g.energy_mean_tail, p.energy_mean_tail
+            );
+        }
+    } else {
+        println!(
+            "{:>5} {:>10} {:>10} {:>10} {:>14} {:>14}",
+            "stage", "T (K)", "acc cpu", "acc py", "<E> cpu (eV)", "<E> py (eV)"
+        );
+        for i in 0..rust.stages.len() {
+            let r = &rust.stages[i];
+            let p = &py.stages[i];
+            println!(
+                "{:>5} {:>10.1} {:>10.4} {:>10.4} {:>14.4e} {:>14.4e}",
+                i, r.temperature, r.acceptance, p.acceptance,
+                r.energy_mean_tail, p.energy_mean_tail
+            );
+        }
     }
-    let fails = compare(&sc, &rust, &py);
+
+    let mut fails = compare_pair(&sc, &rust, &py, "rust", "py");
+    if let Some(ref g) = gpu {
+        fails.extend(compare_pair(&sc, g, &rust, "gpu", "rust"));
+        fails.extend(compare_pair(&sc, g, &py, "gpu", "py"));
+    }
     let out = std::io::stdout();
     let mut lock = out.lock();
     if fails.is_empty() {
