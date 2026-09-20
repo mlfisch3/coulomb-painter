@@ -1,0 +1,14 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Repository automation tasks (android cross-compile, WGSL naga validation)."
+
+[dependencies]
+# Pinned to the naga version wgpu 0.19 uses so the validator matches what the
+# runtime actually parses. Bump this together with the wgpu bump.
+naga = { version = "0.19", features = ["wgsl-in", "spv-out"] }

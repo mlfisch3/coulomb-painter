@@ -7,6 +7,10 @@ license.workspace = true
 authors.workspace = true
 description = "wgpu port of the coulomb-core physics kernel (M2). Tiled 2x2 coloured Metropolis in WGSL."
 
+[lib]
+# rlib for workspace consumers, cdylib for Android's JNI loader.
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 coulomb-core = { path = "../coulomb-core" }
 wgpu = { version = "0.19", default-features = false, features = ["wgsl"] }

@@ -74,8 +74,60 @@ cargo test -p coulomb-gpu  --release      # needs a wgpu adapter
 
 Bit-for-bit is not required for the trajectory, but the initial energy is bit-identical (14 significant figures) because initial placement is deterministic and both engines build `u_edge` and the mobile-mobile kernel from the same closed-form expressions.
 
+## Android build
+
+M2b cross-compiles `coulomb-core` and `coulomb-gpu` to `aarch64-linux-android` (arm64-v8a) and `armv7-linux-androideabi` (armeabi-v7a) and validates the WGSL kernel down to SPIR-V so Android's Vulkan backend will accept it.
+No device or emulator is involved at this milestone; JNI glue and the Compose UI arrive with M3.
+
+Prerequisites (one-time):
+
+```bash
+# 1. Android NDK. r27d (27.3.13750724) is what M2b was landed with; r26+ is fine.
+#    Install via Android Studio's SDK Manager, sdkmanager --install "ndk;27.3.13750724",
+#    or setup-ndk in CI. Then export ANDROID_NDK_HOME to that install.
+export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/27.3.13750724
+
+# 2. cargo-ndk (thin wrapper that hands cargo the right linker + sysroot).
+cargo install cargo-ndk --locked
+
+# 3. Rust std for both android targets, on the pinned toolchain.
+rustup target add aarch64-linux-android armv7-linux-androideabi
+```
+
+Then, from `rust/`:
+
+```bash
+cargo xtask android-build
+```
+
+That single command:
+
+1. Fails loudly if `ANDROID_NDK_HOME` (or `ANDROID_NDK_ROOT`) is not set or does not point at an NDK install.
+2. Runs `naga` (pinned to the same version wgpu 0.19 uses) over `coulomb-gpu`'s WGSL sources, validates them, and lowers each to SPIR-V.
+   A parse or validation error fails the task before any expensive cross-compile starts.
+   The task is defined in `xtask/` and exposed as a `cargo` alias in `rust/.cargo/config.toml`; `cargo xtask validate-wgsl` runs the WGSL step on its own.
+3. Runs `cargo ndk -t arm64-v8a -t armeabi-v7a build --release -p coulomb-core -p coulomb-gpu`.
+4. Prints the built `.so` paths and sizes.
+
+Expected outputs (release, unstripped, NDK r27d, Rust 1.95, sizes are approximate; the arm64 build is a few percent smaller than debug):
+
+```
+target/aarch64-linux-android/release/libcoulomb_core.so   ~ 450 KB
+target/aarch64-linux-android/release/libcoulomb_gpu.so    ~ 780 KB
+target/armv7-linux-androideabi/release/libcoulomb_core.so ~   7 KB
+target/armv7-linux-androideabi/release/libcoulomb_gpu.so  ~ 335 KB
+```
+
+The `libcoulomb_core.so` on armv7 is small on purpose.
+`coulomb-core` exports no C ABI symbols today, so under `-C link-arg=--gc-sections` (the Android default) the cdylib is nearly runtime-only.
+Its physics is linked in transitively wherever downstream crates use the rlib (which is what `coulomb-gpu` does, and what M3's JNI crate will do).
+
+The `crate-type = ["rlib", "cdylib"]` declaration on both crates is what lets the same `cargo build` produce both: the rlib for the workspace's own bench/validate/test consumers, and a `.so` for `cargo ndk`.
+
+CI: `.github/workflows/android-build.yml` runs the same task on `ubuntu-latest`.
+It is not (yet) a required check for merge - see the M2b PR body.
+
 ## What's not here yet
 
-- Cross-compilation to `aarch64-linux-android`: M2b.
 - Android JNI bindings, Jetpack Compose UI, SurfaceControl: M3.
 - `.cmb` save/load, brush undo persistence across GPU restart, GPU-side brush `u_edge` patching: M5.

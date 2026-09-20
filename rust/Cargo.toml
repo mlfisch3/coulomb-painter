@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["coulomb-core", "coulomb-gpu", "coulomb-bench", "coulomb-validate"]
+members = ["coulomb-core", "coulomb-gpu", "coulomb-bench", "coulomb-validate", "xtask"]
 
 [workspace.package]
 edition = "2021"

@@ -7,6 +7,11 @@ license.workspace = true
 authors.workspace = true
 description = "CPU physics kernel for the Coulomb Painter (M1 reference; the GPU port is M2)."
 
+[lib]
+# rlib for the workspace's own consumers (validate, bench, gpu crate); cdylib
+# so `cargo ndk` produces a loadable .so for the Android app's JNI layer.
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 rand_pcg = "0.3"
