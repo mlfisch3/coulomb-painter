@@ -1,0 +1,46 @@
+# M2b cross-compile stub.
+#
+# Runs the same `cargo xtask android-build` a contributor runs locally: adds
+# the Android rust targets, installs cargo-ndk, provisions an NDK, and builds
+# coulomb-core + coulomb-gpu for arm64-v8a and armeabi-v7a. The WGSL
+# naga-to-SPIR-V validation runs first inside the xtask.
+#
+# Deliberately NOT wired as a required status check on this PR - see M2b's PR
+# body. A follow-up can add `branches: [main]` and mark this required once
+# it has stabilised.
+
+name: android-build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "rust/**"
+      - ".github/workflows/android-build.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain (from rust-toolchain.toml)
+        working-directory: rust
+        run: |
+          rustup show
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+
+      - name: install cargo-ndk
+        run: cargo install cargo-ndk --locked --version ^4
+
+      - name: set up Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: cross-compile + WGSL naga validation
+        working-directory: rust
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo xtask android-build
