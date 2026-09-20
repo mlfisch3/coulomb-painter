@@ -1,0 +1,17 @@
+[package]
+name = "coulomb-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CPU physics kernel for the Coulomb Painter (M1 reference; the GPU port is M2)."
+
+[dependencies]
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+rand_pcg = "0.3"
+rustfft = "6.2"
+num-complex = "0.4"
+
+[dev-dependencies]
+approx = "0.5"

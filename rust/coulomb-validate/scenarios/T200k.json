@@ -1,0 +1,29 @@
+{
+  "name": "T200k: hot batch-Metropolis, 128x128, no paint",
+  "h": 128,
+  "w": 128,
+  "seed": 20260920,
+  "particles": 1600,
+  "cutoff": 8.0,
+  "screening": 4.0,
+  "strength": 1.0,
+  "charge": 1.0,
+  "attract_depth": 0.0,
+  "attract_range": 1.5,
+  "periodic": false,
+  "batch": 1,
+  "batch_min": 1,
+  "batch_decrement": 1,
+  "fail_limit": 12,
+  "step_size": 2,
+  "chains": 4,
+  "accept_tol": 0.01,
+  "energy_tol": 0.01,
+  "stages": [
+    {
+      "temperature": 200000.0,
+      "iterations": 30000,
+      "energy_sample_every": 50
+    }
+  ]
+}
