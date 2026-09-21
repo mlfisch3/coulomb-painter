@@ -1,0 +1,31 @@
+[package]
+name = "coulomb-jni"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "JNI bridge from coulomb-core to the Kotlin/Compose Android app (M3a)."
+
+[lib]
+# cdylib produces libcoulomb_jni.so for Android's System.loadLibrary.
+# rlib lets host-side unit tests link the module directly through cargo test.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+coulomb-core = { path = "../coulomb-core" }
+# jni-rs is the standard Rust <-> JNI binding. `no_std` shims and hand-rolled
+# ABIs both trade too much safety for no measurable gain; the mangling matches
+# Android's JNIEnv contract when we use jni-rs's macro-free `pub extern "system"`
+# functions with the Java_com_coulombpainter_CoulombNative_* names.
+jni = { version = "0.21", default-features = false }
+# serde_json only for the params load/dump entrypoints. The kernel itself does
+# not depend on it; keeping the dep here isolates the JSON surface to the JNI
+# boundary where JSON is the wire format the Kotlin side uses.
+serde_json = "1"
+
+[dev-dependencies]
+# `invocation` links the JVM at test time so create/tick/stats round-trips run
+# through the real JNI machinery, not just an in-process function call. The
+# LD_LIBRARY_PATH shim in `tests/README` documents the expected JVM layout.
+jni = { version = "0.21", features = ["invocation"] }

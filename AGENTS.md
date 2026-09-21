@@ -8,7 +8,11 @@ The full plan and per-milestone exit criteria are in `docs/android-plan.md`; rea
 - `docs/android-plan.md` - authoritative plan, non-goals, milestone list.
 - `rust/` - Cargo workspace for the shared physics core.
   See `rust/README.md` for how the CPU reference, WGSL kernel (M2), and validator relate.
-- Nothing under `rust/target/` is committed.
+- `rust/coulomb-jni/` - JNI bridge for the Android app.
+  `rust/coulomb-jni/README.md` documents the ~20-function C ABI and the panic-catch contract.
+- `android/` - Compose Android Studio project (M3a).
+  Its `README.md` covers prerequisites, `./gradlew :app:assembleDebug`, and how the Rust cross-compile is hooked into the Gradle build.
+- Nothing under `rust/target/` or `android/*/build/` is committed.
 
 ## Physics reference
 

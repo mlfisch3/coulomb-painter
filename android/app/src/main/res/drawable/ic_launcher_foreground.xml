@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+Minimal foreground: two orbiting dots on a dark disc, evoking the paired
+charges the app paints. Kept as an inline vector so no bitmap assets ship in
+M3a; the polished icon set lands with M6 (release polish).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#40e0d0"
+        android:pathData="M54,54m-6,0a6,6 0 1,0 12,0a6,6 0 1,0 -12,0" />
+    <path
+        android:fillColor="#ffb46b"
+        android:pathData="M40,40m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0" />
+    <path
+        android:fillColor="#6ba7ff"
+        android:pathData="M70,64m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0" />
+</vector>

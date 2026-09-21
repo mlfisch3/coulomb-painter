@@ -1,0 +1,18 @@
+# Machine-specific SDK/NDK path. Regenerated per checkout.
+local.properties
+
+# Gradle + build caches.
+.gradle/
+build/
+app/build/
+*/build/
+
+# Android Studio project files.
+.idea/
+*.iml
+
+# Kotlin symbol processing incremental state.
+.kotlin/
+
+# On-tree Rust jni libs staging (produced by copyRustJniLibs).
+app/src/main/jniLibs/

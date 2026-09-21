@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- M3a keeps no persistent data; M5 wires .cmb save/load and revisits this. -->
+</full-backup-content>
