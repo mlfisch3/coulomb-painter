@@ -500,11 +500,15 @@ mod android {
         })
     }
 
-    // Two-triangle full-viewport shader that samples the CPU occupancy buffer
-    // and paints each occupied cell in the mockup's warm accent, unoccupied
-    // cells in the mockup's canvas indigo. Kept inline rather than referring
-    // to coulomb-gpu's render.wgsl because the surface path uses a portrait
-    // aspect the desktop render does not.
+    // Two-triangle full-viewport shader. The `cells` buffer packs one u32
+    // per lattice site with:
+    //   bit 0 = mobile particle (occ)
+    //   bit 1 = painted (fixed) charge - always drawn on top of mobile
+    // Palette matches the captain's reference desktop screenshot: teal-cyan
+    // #40e0d0 for painted charge, amber-orange #ffb46b for mobile particles,
+    // dark navy #0d1322 for the empty background. Kept inline rather than
+    // sharing coulomb-gpu's render.wgsl because the surface path uses a
+    // portrait aspect that shader does not.
     const SURFACE_RENDER_WGSL: &str = r#"
 struct Params {
     w: u32,
@@ -512,7 +516,7 @@ struct Params {
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
-@group(0) @binding(1) var<storage, read> occ: array<u32>;
+@group(0) @binding(1) var<storage, read> cells: array<u32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -536,11 +540,17 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let sx = clamp(u32(in.uv.x * f32(P.w)), 0u, P.w - 1u);
     let sy = clamp(u32((1.0 - in.uv.y) * f32(P.h)), 0u, P.h - 1u);
-    let v = occ[sy * P.w + sx];
-    if v == 0u {
-        return vec4<f32>(0.021, 0.028, 0.043, 1.0);
+    let v = cells[sy * P.w + sx];
+    if (v & 2u) != 0u {
+        // Painted fixed charge - teal-cyan.
+        return vec4<f32>(0.251, 0.878, 0.816, 1.0);
     }
-    return vec4<f32>(0.98, 0.76, 0.28, 1.0);
+    if (v & 1u) != 0u {
+        // Mobile particle - amber-orange.
+        return vec4<f32>(1.0, 0.706, 0.42, 1.0);
+    }
+    // Empty background - dark navy.
+    return vec4<f32>(0.051, 0.075, 0.133, 1.0);
 }
 "#;
 }

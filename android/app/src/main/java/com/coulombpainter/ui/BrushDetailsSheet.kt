@@ -34,6 +34,7 @@ fun BrushDetailsSheet(
     onDismiss: () -> Unit,
     onChange: (BrushSettings) -> Unit,
     onHelp: (String) -> Unit,
+    onResetDefaults: () -> Unit = {},
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
@@ -74,6 +75,32 @@ fun BrushDetailsSheet(
             BrushRow("budget (px)", brush.budget, 1.0..512.0,
                 onHelp = { onHelp("brush.budget") },
                 onChange = { onChange(brush.copy(budget = it)) })
+            // Firstmate bug #8: one-tap restore of every brush field to
+            // the defaults `projects/coulomb-brush` ships with, which are
+            // what `BrushSettings()` (the no-arg constructor) returns.
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp, bottom = 4.dp),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .clickable { onResetDefaults() }
+                        .background(
+                            CpPanel2,
+                            shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+                        )
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                ) {
+                    Text(
+                        "Reset to defaults",
+                        color = CpAccent,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+            }
         }
     }
 }

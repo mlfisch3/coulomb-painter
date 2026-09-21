@@ -52,10 +52,13 @@ private const val TAG = "PhysicsSurface"
 fun PhysicsSurface(
     vm: SimViewModel,
     lattice: Int,
+    touchEnabled: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
     val scope = rememberCoroutineScope()
     val renderJobRef = remember { object { var job: Job? = null } }
+    val touchEnabledRef = remember { object { var v: Boolean = true } }
+    touchEnabledRef.v = touchEnabled
 
     Box(modifier = modifier.fillMaxSize()) {
         AndroidView(
@@ -68,6 +71,10 @@ fun PhysicsSurface(
                     // receives events for the canvas area, Compose sees the
                     // rest.
                     setOnTouchListener { view, event ->
+                        // Firstmate bug #2: when the drawer is open, refuse
+                        // the touch so the dismiss-tap does not also paint.
+                        // The next tap after the drawer closes paints.
+                        if (!touchEnabledRef.v) return@setOnTouchListener false
                         handleTouch(vm, view, event, lattice)
                     }
                     holder.addCallback(object : SurfaceHolder.Callback {

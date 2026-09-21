@@ -20,7 +20,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.DeviceThermostat
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -75,13 +75,20 @@ fun CoulombPainterApp(vm: SimViewModel) {
 
     var showBrushSheet by remember { mutableStateOf(false) }
     var showNewCanvasDialog by remember { mutableStateOf(false) }
+    var showResetCanvasDialog by remember { mutableStateOf(false) }
     var helpTopic by remember { mutableStateOf<String?>(null) }
 
     val lattice by vm.lattice.collectAsState()
     val showDiagnostics by vm.showDiagnostics.collectAsState()
+    val drawerIsOpen = drawerState.isOpen || drawerState.targetValue == DrawerValue.Open
 
     ModalNavigationDrawer(
         drawerState = drawerState,
+        // Firstmate bug #1: edge-swipe on the canvas otherwise opens the
+        // drawer and swallows any right-going paint stroke. The hamburger
+        // icon is the only way in now; a right-drag on the canvas reaches
+        // the paint pipeline.
+        gesturesEnabled = false,
         drawerContent = {
             ParametersDrawer(
                 params = params,
@@ -89,17 +96,25 @@ fun CoulombPainterApp(vm: SimViewModel) {
                 onHelp = { helpTopic = it },
                 showDiagnostics = showDiagnostics,
                 onToggleDiagnostics = { vm.setShowDiagnostics(it) },
+                onResetCanvas = { showResetCanvasDialog = true },
             )
         },
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            PhysicsSurface(vm = vm, lattice = lattice, modifier = Modifier.fillMaxSize())
+            PhysicsSurface(
+                vm = vm,
+                lattice = lattice,
+                // Firstmate bug #2: refuse touches when the drawer is open,
+                // so the tap that dismisses the drawer is not also read as
+                // a paint stroke.
+                touchEnabled = !drawerIsOpen,
+                modifier = Modifier.fillMaxSize(),
+            )
 
             Column(modifier = Modifier.fillMaxSize()) {
                 TopBar(
                     running = running,
                     onMenu = { coroutineScope.launch { drawerState.open() } },
-                    onNewCanvas = { showNewCanvasDialog = true },
                     onToggleRun = { vm.setRunning(!running) },
                 )
                 Spacer(Modifier.weight(1f))
@@ -125,12 +140,23 @@ fun CoulombPainterApp(vm: SimViewModel) {
             onDismiss = { showBrushSheet = false },
             onChange = { vm.setBrush(it) },
             onHelp = { helpTopic = it },
+            onResetDefaults = { vm.setBrush(com.coulombpainter.BrushSettings()) },
         )
     }
     if (showNewCanvasDialog) {
         NewCanvasDialog(
             onDismiss = { showNewCanvasDialog = false },
             onConfirm = { showNewCanvasDialog = false },
+        )
+    }
+    if (showResetCanvasDialog) {
+        ResetCanvasDialog(
+            onCancel = { showResetCanvasDialog = false },
+            onConfirm = {
+                vm.resetCanvas()
+                showResetCanvasDialog = false
+                coroutineScope.launch { drawerState.close() }
+            },
         )
     }
     helpTopic?.let {
@@ -148,11 +174,15 @@ fun Mode.next(): Mode = when (this) {
 private fun TopBar(
     running: Boolean,
     onMenu: () -> Unit,
-    onNewCanvas: () -> Unit,
     onToggleRun: () -> Unit,
 ) {
-    // Fix from firstmate bug #1: top bar honours WindowInsets.statusBars so
-    // the icons are not under the notch. Canvas stays edge-to-edge behind it.
+    // Top bar honours WindowInsets.statusBars so the icons are not under
+    // the notch. Canvas stays edge-to-edge behind it.
+    //
+    // Firstmate bug #5: no lightning-bolt icons anywhere. The former "New
+    // canvas" bolt is gone (Reset canvas now lives in the hamburger menu);
+    // the former "Auto temperature" bolt is a DeviceThermostat. Menu and
+    // pause icons remain distinct.
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -173,13 +203,10 @@ private fun TopBar(
                 .weight(1f)
                 .padding(horizontal = 8.dp),
         )
-        IconButton(onClick = onNewCanvas) {
-            Icon(Icons.Filled.Bolt, contentDescription = "New canvas", tint = CpDim)
-        }
-        // Fix from firstmate bug #2: log the tap so logcat proves the click
-        // reached the ViewModel. `running` observed and re-rendered means the
-        // icon actually flips between pause/play when tapped now that the
-        // physics surface honours the running flag.
+        // Log the tap so logcat proves the click reached the ViewModel.
+        // `running` observed and re-rendered means the icon actually flips
+        // between pause/play when tapped now that the physics surface
+        // honours the running flag.
         IconButton(onClick = {
             Log.d("CoulombPainter", "play tapped (running=$running)")
             onToggleRun()
@@ -191,7 +218,11 @@ private fun TopBar(
             }
         }
         IconButton(onClick = { /* auto-T toggle lands with M4 */ }) {
-            Icon(Icons.Filled.Bolt, contentDescription = "Auto temperature", tint = CpAccentHot)
+            Icon(
+                Icons.Filled.DeviceThermostat,
+                contentDescription = "Auto temperature",
+                tint = CpAccentHot,
+            )
         }
     }
 }
@@ -385,3 +416,31 @@ private fun compactMps(mps: Double): String {
 // Fallback tokens so a colour reference below stays in one place instead of
 // spreading Color(0x...) constants across composables.
 private val CpDivider = CpLine
+
+@Composable
+private fun ResetCanvasDialog(
+    onCancel: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Reset canvas?") },
+        text = {
+            Text(
+                "The current painted charges and particle arrangement will be discarded. " +
+                    "This cannot be undone.",
+                fontSize = 13.sp,
+            )
+        },
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = onConfirm) {
+                Text("Reset")
+            }
+        },
+        dismissButton = {
+            androidx.compose.material3.TextButton(onClick = onCancel) {
+                Text("Cancel")
+            }
+        },
+    )
+}

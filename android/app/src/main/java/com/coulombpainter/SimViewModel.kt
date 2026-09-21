@@ -206,29 +206,46 @@ class SimViewModel : ViewModel() {
     fun brushSignSnapshot(): Double = _brush.value.sign
 
     /**
-     * Touch-driven paint: run on the default dispatcher so a paint stroke
-     * that waits for the sim mutex does not stall the main thread. The
-     * caller (PhysicsSurface's OnTouchListener) fires and forgets; the
-     * ordering here matches ACTION_DOWN -> ACTION_MOVE* -> ACTION_UP.
+     * Touch-driven paint. Firstmate bug #6: a per-point coroutine launch
+     * would race the ACTION_UP callback and drop tail points on a fast
+     * swipe. `paintBegin` / `paintPoint` are cheap (Vec::push through a
+     * small mutex on the Rust side), so we run them synchronously in the
+     * caller's thread; ordering is preserved by call order. `paintEnd`
+     * takes the physics-side sim mutex (paint_stroke recomputes the
+     * u_edge patch), so it goes to Default to avoid stalling the touch
+     * callback.
      */
     fun paintBegin(sign: Double) {
         if (handle == 0L) return
-        viewModelScope.launch(Dispatchers.Default) {
-            CoulombNative.nativeSimPaintBegin(handle, sign)
-        }
+        CoulombNative.nativeSimPaintBegin(handle, sign)
     }
 
     fun paintPoint(x: Double, y: Double, timestamp: Double) {
         if (handle == 0L) return
-        viewModelScope.launch(Dispatchers.Default) {
-            CoulombNative.nativeSimPaintStrokePoint(handle, x, y, timestamp)
-        }
+        CoulombNative.nativeSimPaintStrokePoint(handle, x, y, timestamp)
     }
 
     fun paintEnd() {
         if (handle == 0L) return
         viewModelScope.launch(Dispatchers.Default) {
             CoulombNative.nativeSimPaintEnd(handle)
+        }
+    }
+
+    /**
+     * Reset the sim to a fresh blank at the current params. The
+     * `nativeSimLoadPreset("blank")` path in `coulomb-jni` rebuilds a
+     * Sim with the current Params via `Sim::new_blank`, which is what
+     * firstmate bug #7 asks for.
+     */
+    fun resetCanvas() {
+        if (handle == 0L) return
+        viewModelScope.launch(Dispatchers.Default) {
+            CoulombNative.nativeSimLoadPreset(handle, "blank")
+            // Reset baseline energy so the "energy drop" telemetry does
+            // not stay pinned to the pre-reset baseline. Cheap since it
+            // just reads current stats.
+            onAdapterInfoRefresh()
         }
     }
 
@@ -309,7 +326,10 @@ data class BrushSettings(
 data class ParamsSnapshot(
     val resolution: Int = 512,
     val lineDensity: Double = 1.0,
-    val periodic: Boolean = false,
+    // Firstmate bug #9: periodic boundary on by default so a painted
+    // charge on the far left influences the far right; matches the
+    // Rust-side Params override in nativeSimCreate.
+    val periodic: Boolean = true,
     val temperature: Double = 5000.0,
     val strength: Double = 1.0,
     val screening: Double = 0.0,

@@ -147,6 +147,12 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimCreate(
             h: h as usize,
             w: w as usize,
             seed: seed as u64,
+            // Firstmate bug #9: periodic boundary on by default. The
+            // desktop reference uses wrapped boundaries so a charge on
+            // the far left of the canvas exerts its influence on the far
+            // right too. Users who want a hard-wall boundary can toggle
+            // it off in the drawer.
+            periodic: true,
             ..Params::default()
         };
         let sim = Sim::new_blank(params, n_particles as usize);
@@ -365,17 +371,26 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRenderFram
         };
         let sim = h.sim.lock().unwrap();
         let occ = sim.occupancy();
+        let u_edge = sim.u_edge();
         let (w, h_sz) = (sim.params().w as u32, sim.params().h as u32);
-        // Convert bool[] to u32[] in a reusable scratch buffer. The vector
-        // shrinks only on lattice resize (rare); grows at most once during
-        // the first render.
+        // Pack occ + painted into one u32 per cell (bit 0 = mobile, bit 1
+        // = painted fixed charge). `u_edge != 0` is what the desktop
+        // reference uses to distinguish painted cells (see the desktop
+        // brush.py's `sim.painted` accumulator, which feeds u_edge).
         let mut scratch = h.occ_scratch.lock().unwrap();
         if scratch.len() != occ.len() {
             scratch.clear();
             scratch.reserve(occ.len());
         }
         scratch.clear();
-        scratch.extend(occ.iter().map(|&b| if b { 1u32 } else { 0u32 }));
+        for i in 0..occ.len() {
+            let mut cell: u32 = 0;
+            if occ[i] { cell |= 1; }
+            // A small non-zero threshold covers the paint stroke's
+            // patch-blend edges without lighting up floating-point noise.
+            if u_edge[i].abs() > 1e-6 { cell |= 2; }
+            scratch.push(cell);
+        }
         // Drop the sim lock before touching wgpu so a slow submit does not
         // block the physics tick thread waiting behind the render.
         drop(sim);
@@ -658,11 +673,22 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadPreset
         if name != "blank" {
             return JNI_FALSE;
         }
+        // Preserve params AND the current particle count so `Reset canvas`
+        // gives the user a fresh arrangement of the same charge population;
+        // n=0 would leave a blank navy field, which is not the reset the
+        // captain asks for in firstmate bug #7.
         let sim_ref = h.sim.lock().unwrap();
         let params = sim_ref.params().clone();
+        let n = sim_ref.occupancy().iter().filter(|&&b| b).count();
         drop(sim_ref);
-        let fresh = Sim::new_blank(params, 0);
+        let fresh = Sim::new_blank(params, n);
+        let energy = fresh.stats().energy;
         *h.sim.lock().unwrap() = fresh;
+        // Reset the "energy drop" telemetry baseline so the diagnostic
+        // overlay's delta reflects the settling after reset, not before.
+        let mut telem = h.telem.lock().unwrap();
+        telem.baseline_energy = energy;
+        telem.paint_cells_total = 0;
         JNI_TRUE
     })
 }

@@ -53,6 +53,7 @@ fun ParametersDrawer(
     onHelp: (String) -> Unit,
     showDiagnostics: Boolean = false,
     onToggleDiagnostics: (Boolean) -> Unit = {},
+    onResetCanvas: () -> Unit = {},
 ) {
     ModalDrawerSheet(
         drawerContainerColor = CpPanel,
@@ -71,6 +72,29 @@ fun ParametersDrawer(
                 fontSize = 15.sp,
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+            // Firstmate bug #7: Reset canvas at the top of the drawer.
+            // Confirmation dialog lives in CoulombPainterApp; this row
+            // only asks for it.
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onResetCanvas() }
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Reset canvas",
+                    color = CpAccent,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(CpLine),
             )
             AccordionGroup(title = "Source & Lattice", initiallyOpen = true) {
                 ParamRow("image", "wire_mesh", onHelp = { onHelp("source.image") })
@@ -145,7 +169,11 @@ fun ParametersDrawer(
                 )
             }
             AccordionGroup(title = "Display", initiallyOpen = false) {
-                ParamRow("show painted overlay", "off", onHelp = { onHelp("display.painted") })
+                // Firstmate bug #3: painted charges are visible by default
+                // so the user sees the lines they drew, not just their
+                // repulsive effect. Renderer draws painted cells in
+                // teal-cyan on top of the mobile amber layer.
+                ParamRow("show painted charge", "on", onHelp = { onHelp("display.painted") })
                 ParamRow("lens", "off", onHelp = { onHelp("display.lens") })
             }
             Spacer(Modifier.height(24.dp))
