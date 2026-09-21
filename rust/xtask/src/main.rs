@@ -146,6 +146,8 @@ fn android_build() -> Result<(), String> {
             "coulomb-core",
             "-p",
             "coulomb-gpu",
+            "-p",
+            "coulomb-jni",
         ])
         .status()
         .map_err(|e| format!("spawn cargo ndk: {e}. Is cargo-ndk installed?"))?;
@@ -157,7 +159,12 @@ fn android_build() -> Result<(), String> {
         ("aarch64-linux-android", "arm64-v8a"),
         ("armv7-linux-androideabi", "armeabi-v7a"),
     ];
-    let libs = ["libcoulomb_core.so", "libcoulomb_gpu.so"];
+    // libcoulomb_jni.so is the only .so actually loaded by System.loadLibrary
+    // in the app: it re-exports what it uses from coulomb-core and coulomb-gpu
+    // (both linked as rlibs into the cdylib). The bare core/gpu .so files are
+    // kept in the report as an incidental sanity check that the whole crate
+    // set still cross-compiles cleanly.
+    let libs = ["libcoulomb_core.so", "libcoulomb_gpu.so", "libcoulomb_jni.so"];
     println!();
     println!("built shared libraries:");
     for (triple, abi) in outputs {

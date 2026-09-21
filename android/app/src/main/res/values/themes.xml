@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+    Platform theme is deliberately minimal; the visible surface is Compose.
+    NoActionBar + edge-to-edge friendly window flags keep the pre-Compose
+    frame from painting over the canvas at cold-start.
+    -->
+    <style name="Theme.CoulombPainter" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/cp_bg</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

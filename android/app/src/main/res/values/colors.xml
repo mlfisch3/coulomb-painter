@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+    Palette pulled directly from .lavish/android-plan.html so the platform
+    theme and the Compose theme agree on the same tokens.
+    -->
+    <color name="cp_bg">#0d1322</color>
+    <color name="cp_panel">#111729</color>
+    <color name="cp_ink">#dce6f5</color>
+    <color name="cp_accent">#40e0d0</color>
+</resources>
