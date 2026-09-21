@@ -1,5 +1,6 @@
 package com.coulombpainter.ui
 
+import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -12,6 +13,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ModalDrawerSheet
@@ -48,6 +51,8 @@ fun ParametersDrawer(
     params: ParamsSnapshot,
     onParamChange: (String, Double) -> Unit,
     onHelp: (String) -> Unit,
+    showDiagnostics: Boolean = false,
+    onToggleDiagnostics: (Boolean) -> Unit = {},
 ) {
     ModalDrawerSheet(
         drawerContainerColor = CpPanel,
@@ -98,8 +103,20 @@ fun ParametersDrawer(
                     onHelp = { onHelp("attract.range") })
             }
             AccordionGroup(title = "Annealing", initiallyOpen = true) {
-                ParamRow("temperature (K)", "%.2f".format(params.temperature),
+                ParamRow("temperature (K)", "%.0f".format(params.temperature),
                     onHelp = { onHelp("anneal.temperature") })
+                // Live slider for the one param the CPU core exposes as
+                // live-mutable (apply_param in coulomb-jni/src/lib.rs). The
+                // Log.d line proves the JNI hop happened, per firstmate bug
+                // #3. The drag range is 100 K to 200 kK; the desktop
+                // reference spans the same interval.
+                TempSliderRow(
+                    value = params.temperature,
+                    onValueChangeFinished = { v ->
+                        Log.d("CoulombPainter", "param temperature set to $v")
+                        onParamChange("temperature", v)
+                    },
+                )
                 ParamRow("cooling active", if (params.coolingActive) "on" else "off",
                     onHelp = { onHelp("anneal.cooling_active") })
                 ParamRow("schedule", params.schedule,
@@ -120,6 +137,12 @@ fun ParametersDrawer(
                     onHelp = { onHelp("compute.step_size") })
                 ParamRow("gpu backend", "wgpu (Vulkan)",
                     onHelp = { onHelp("compute.backend") })
+                ParamRow(
+                    key = "show diagnostics",
+                    value = if (showDiagnostics) "on" else "off",
+                    onHelp = { onHelp("compute.diagnostics") },
+                    onClickValue = { onToggleDiagnostics(!showDiagnostics) },
+                )
             }
             AccordionGroup(title = "Display", initiallyOpen = false) {
                 ParamRow("show painted overlay", "off", onHelp = { onHelp("display.painted") })
@@ -180,10 +203,36 @@ private fun AccordionGroup(
 }
 
 @Composable
+private fun TempSliderRow(
+    value: Double,
+    onValueChangeFinished: (Double) -> Unit,
+) {
+    var draft by remember { mutableStateOf(value.toFloat()) }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 24.dp, end = 16.dp, top = 2.dp, bottom = 8.dp),
+    ) {
+        Slider(
+            value = draft,
+            onValueChange = { draft = it },
+            onValueChangeFinished = { onValueChangeFinished(draft.toDouble()) },
+            valueRange = 100f..200_000f,
+            colors = SliderDefaults.colors(
+                thumbColor = CpAccent,
+                activeTrackColor = CpAccent.copy(alpha = 0.6f),
+                inactiveTrackColor = CpDimmer,
+            ),
+        )
+    }
+}
+
+@Composable
 private fun ParamRow(
     key: String,
     value: String,
     onHelp: () -> Unit,
+    onClickValue: (() -> Unit)? = null,
 ) {
     Row(
         modifier = Modifier
@@ -203,10 +252,12 @@ private fun ParamRow(
             color = CpInk,
             fontSize = 12.sp,
             fontFamily = FontFamily.Monospace,
+            modifier = if (onClickValue != null) Modifier.clickable(onClick = onClickValue) else Modifier,
         )
         HelpChip(onHelp)
     }
 }
+
 
 @Composable
 private fun HelpChip(onClick: () -> Unit) {

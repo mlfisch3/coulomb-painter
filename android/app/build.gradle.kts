@@ -18,8 +18,8 @@ android {
         // will need. `docs/android-plan.md` §2.1 pins this choice.
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-m3a"
+        versionCode = 2
+        versionName = "0.1.0-m3b"
 
         // Only the ABIs the Rust cross-compile produces. A device with an
         // unsupported ABI refuses to install rather than crashing at

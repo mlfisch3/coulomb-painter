@@ -1,19 +1,23 @@
 package com.coulombpainter.ui
 
+import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bolt
@@ -73,6 +77,9 @@ fun CoulombPainterApp(vm: SimViewModel) {
     var showNewCanvasDialog by remember { mutableStateOf(false) }
     var helpTopic by remember { mutableStateOf<String?>(null) }
 
+    val lattice by vm.lattice.collectAsState()
+    val showDiagnostics by vm.showDiagnostics.collectAsState()
+
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
@@ -80,24 +87,13 @@ fun CoulombPainterApp(vm: SimViewModel) {
                 params = params,
                 onParamChange = { key, value -> vm.setParam(key, value) },
                 onHelp = { helpTopic = it },
+                showDiagnostics = showDiagnostics,
+                onToggleDiagnostics = { vm.setShowDiagnostics(it) },
             )
         },
     ) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                // Two-finger tap cycles mode per docs/android-plan.md §4.4.
-                // Compose's pointerInput fires the count-N callback exactly
-                // once per gesture, which is the M3a semantic; drag/pinch
-                // wiring lands with the M3b touch pipeline.
-                .pointerInput(Unit) {
-                    detectTapGestures(
-                        onTap = { /* single tap: M3b paint */ },
-                        onDoubleTap = { vm.setMode(mode.next()) },
-                    )
-                },
-        ) {
-            StubCanvas(modifier = Modifier.fillMaxSize())
+        Box(modifier = Modifier.fillMaxSize()) {
+            PhysicsSurface(vm = vm, lattice = lattice, modifier = Modifier.fillMaxSize())
 
             Column(modifier = Modifier.fillMaxSize()) {
                 TopBar(
@@ -115,6 +111,10 @@ fun CoulombPainterApp(vm: SimViewModel) {
                     onSign = { s -> vm.setBrush(brush.copy(sign = s)) },
                     onBrushMore = { showBrushSheet = true },
                 )
+            }
+
+            if (showDiagnostics) {
+                DiagnosticOverlay(vm = vm, onDismiss = { vm.setShowDiagnostics(false) })
             }
         }
     }
@@ -138,7 +138,7 @@ fun CoulombPainterApp(vm: SimViewModel) {
     }
 }
 
-private fun Mode.next(): Mode = when (this) {
+fun Mode.next(): Mode = when (this) {
     Mode.Paint -> Mode.Heat
     Mode.Heat -> Mode.View
     Mode.View -> Mode.Paint
@@ -151,10 +151,13 @@ private fun TopBar(
     onNewCanvas: () -> Unit,
     onToggleRun: () -> Unit,
 ) {
+    // Fix from firstmate bug #1: top bar honours WindowInsets.statusBars so
+    // the icons are not under the notch. Canvas stays edge-to-edge behind it.
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .background(CpPanel.copy(alpha = 0.85f))
+            .windowInsetsPadding(WindowInsets.statusBars)
             .padding(horizontal = 8.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -173,7 +176,14 @@ private fun TopBar(
         IconButton(onClick = onNewCanvas) {
             Icon(Icons.Filled.Bolt, contentDescription = "New canvas", tint = CpDim)
         }
-        IconButton(onClick = onToggleRun) {
+        // Fix from firstmate bug #2: log the tap so logcat proves the click
+        // reached the ViewModel. `running` observed and re-rendered means the
+        // icon actually flips between pause/play when tapped now that the
+        // physics surface honours the running flag.
+        IconButton(onClick = {
+            Log.d("CoulombPainter", "play tapped (running=$running)")
+            onToggleRun()
+        }) {
             if (running) {
                 Icon(Icons.Filled.Pause, contentDescription = "Pause", tint = CpInk)
             } else {
@@ -230,6 +240,7 @@ private fun BottomBar(
         modifier = Modifier
             .fillMaxWidth()
             .background(CpPanel.copy(alpha = 0.9f))
+            .windowInsetsPadding(WindowInsets.navigationBars)
             .padding(horizontal = 10.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

@@ -132,10 +132,16 @@ fn android_build() -> Result<(), String> {
     validate_wgsl()?;
 
     let root = workspace_root();
+    // `--platform 26` picks the same sysroot that the AGP build targets
+    // via `minSdk = 26`. Without an explicit platform, `cargo ndk` defaults
+    // to API 21, whose sysroot pre-dates `libnativewindow.so` / `libaaudio.so`
+    // and the ndk crate's `all` feature refuses to link.
     let status = Command::new("cargo")
         .current_dir(&root)
         .args([
             "ndk",
+            "--platform",
+            "26",
             "-t",
             "arm64-v8a",
             "-t",

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "JNI bridge from coulomb-core to the Kotlin/Compose Android app (M3a)."
+description = "JNI bridge from coulomb-core to the Kotlin/Compose Android app (M3a + M3b)."
 
 [lib]
 # cdylib produces libcoulomb_jni.so for Android's System.loadLibrary.
@@ -23,6 +23,23 @@ jni = { version = "0.21", default-features = false }
 # not depend on it; keeping the dep here isolates the JSON surface to the JNI
 # boundary where JSON is the wire format the Kotlin side uses.
 serde_json = "1"
+# wgpu is used by M3b's surface renderer to blit the CPU occupancy buffer
+# into a swapchain image. Same version pin as coulomb-gpu so a single wgpu
+# instance is possible when M3c/M4 promotes the on-device physics to GPU.
+wgpu = { version = "0.19", default-features = false, features = ["wgsl"] }
+bytemuck = { version = "1", features = ["derive"] }
+raw-window-handle = "0.6"
+pollster = "0.3"
+
+# Android-only bindings for ANativeWindow_fromSurface, used to turn the
+# Java Surface handed to sim_bind_surface into a raw window handle wgpu can
+# create a swapchain against. Non-android builds (host tests, coulomb-jni
+# used as an rlib from coulomb-bench or coulomb-validate) skip these deps
+# and compile the renderer as a stub, keeping `cargo test -p coulomb-jni`
+# green on a plain Linux workstation.
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { version = "0.9", features = ["all"] }
+ndk-sys = "0.6"
 
 [dev-dependencies]
 # `invocation` links the JVM at test time so create/tick/stats round-trips run

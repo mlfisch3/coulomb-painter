@@ -18,14 +18,18 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod renderer;
+
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use coulomb_core::{Brush, Params, Sim};
-use jni::objects::{JClass, JDoubleArray, JString};
+use jni::objects::{JClass, JDoubleArray, JObject, JString};
 use jni::sys::{jboolean, jdouble, jlong, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
+
+use crate::renderer::Renderer;
 
 // The mutex is here because the Kotlin caller runs one background loop for
 // the physics tick and a separate UI thread for stats reads; a single lock
@@ -41,6 +45,18 @@ struct SimHandle {
     // paint_end. Kotlin passes touch events one at a time; the physics kernel
     // batches a stroke into one incremental patch update at end-of-stroke.
     stroke: Mutex<Option<InFlightStroke>>,
+
+    // M3b: surface-attached wgpu renderer. `bind_surface` fills this in, and
+    // `unbind_surface` clears it before Kotlin releases the underlying Surface.
+    // `render_frame` no-ops when the slot is empty, so a redundant Kotlin call
+    // (during activity destroy, or before the first surface is available) is
+    // benign rather than a crash.
+    renderer: Mutex<Option<Renderer>>,
+
+    // Reusable scratch buffer for uploading the CPU sim's bool occupancy as
+    // u32 to the render pass. Held inside the handle so a 512x512 sim does
+    // not reallocate 1 MiB per frame.
+    occ_scratch: Mutex<Vec<u32>>,
 }
 
 struct Telemetry {
@@ -55,6 +71,13 @@ struct Telemetry {
     // Baseline resets on paint or preset load; the drop is measured relative
     // to that baseline so a user can see whether the current stroke settled.
     baseline_energy: f64,
+
+    // Total lattice cells the paint brush has touched since the sim was
+    // created. Firstmate's on-device smoke test asserts this is > 0 after a
+    // synthetic swipe, which proves the whole touch -> JNI -> paint_stroke
+    // chain is live. Cumulative rather than per-stroke because a spurious
+    // extra stroke should still count.
+    paint_cells_total: u64,
 }
 
 struct InFlightStroke {
@@ -72,9 +95,12 @@ impl SimHandle {
                 last_tick_iterations: 0,
                 last_mps: 0.0,
                 baseline_energy: energy,
+                paint_cells_total: 0,
             }),
             paused: Mutex::new(false),
             stroke: Mutex::new(None),
+            renderer: Mutex::new(None),
+            occ_scratch: Mutex::new(Vec::new()),
         })
     }
 }
@@ -228,9 +254,9 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimTick(
     })
 }
 
-/// The zero-copy texture-handle export lands in M3b (SurfaceControl + wgpu).
-/// The M3a stub keeps the JNI surface stable so Kotlin can call the method
-/// today; a zero return tells the Compose canvas to use its placeholder.
+/// Kept for backwards compatibility with the M3a stub. Returns 0, since the
+/// M3b flow uses the surface-bind + render-frame pair below, not a raw
+/// texture handle to hand to Compose.
 #[no_mangle]
 pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimFrameTextureHandle(
     _env: JNIEnv,
@@ -238,6 +264,160 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimFrameTextu
     _ptr: jlong,
 ) -> jlong {
     0
+}
+
+// ---------------------------------------------------------------- surface
+
+/// Bind a Java `Surface` (from Compose's AndroidExternalSurface, or from a
+/// SurfaceView holder) to this sim's wgpu renderer. Returns `true` on
+/// success, `false` on any failure (null surface, no adapter, device create
+/// failure). The renderer is single-owner: rebinding replaces any previous
+/// surface. `unbind_surface` must be called before Kotlin lets the Surface
+/// go, so wgpu drops the swapchain before ANativeWindow is invalidated.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimBindSurface<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    ptr: jlong,
+    surface: JObject<'a>,
+) -> jboolean {
+    guard(JNI_FALSE, || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return JNI_FALSE;
+        };
+        // The Renderer constructor is unsafe because it dereferences the
+        // Surface across the JNI boundary; the JNIEnv reference is what
+        // guarantees that the JVM object is alive right now.
+        let raw_obj = surface.as_raw();
+        // SAFETY: env and surface both come from the JVM invocation.
+        let result = unsafe { Renderer::new(&env, raw_obj) };
+        match result {
+            Ok(r) => {
+                *h.renderer.lock().unwrap() = Some(r);
+                JNI_TRUE
+            }
+            Err(_) => JNI_FALSE,
+        }
+    })
+}
+
+/// Drop the wgpu surface and its swapchain, so the Kotlin side can release
+/// the underlying Surface without leaving dangling Vulkan swapchain images
+/// pinned to a dead ANativeWindow. Safe to call with no bound surface.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimUnbindSurface(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    guard((), || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return;
+        };
+        *h.renderer.lock().unwrap() = None;
+    })
+}
+
+/// Ask the renderer to reconfigure its swapchain to `w x h` (raw pixels).
+/// The Compose layer reports the AndroidExternalSurface size in DP; we let
+/// Kotlin convert to pixels since the density is a system property, and the
+/// renderer treats any 0 dimension as "keep current size" so a spurious
+/// pre-layout callback does not tear the swapchain down.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSurfaceResize(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    w: jlong,
+    h: jlong,
+) {
+    guard((), || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h_sim) = (unsafe { handle_from(ptr) }) else {
+            return;
+        };
+        if let Some(r) = h_sim.renderer.lock().unwrap().as_mut() {
+            r.resize(w.max(0) as u32, h.max(0) as u32);
+        }
+    })
+}
+
+/// Draw one frame from the current CPU sim state into the bound swapchain.
+/// No-ops when no surface is bound. Occupancy is packed to u32 on the fly
+/// into a scratch buffer that the handle owns, so the upload cost per frame
+/// is one 1 MiB memcpy at 512x512 - a Vulkan pass on Adreno 750.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRenderFrame(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    guard((), || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return;
+        };
+        let mut renderer_slot = h.renderer.lock().unwrap();
+        let Some(renderer) = renderer_slot.as_mut() else {
+            return;
+        };
+        let sim = h.sim.lock().unwrap();
+        let occ = sim.occupancy();
+        let (w, h_sz) = (sim.params().w as u32, sim.params().h as u32);
+        // Convert bool[] to u32[] in a reusable scratch buffer. The vector
+        // shrinks only on lattice resize (rare); grows at most once during
+        // the first render.
+        let mut scratch = h.occ_scratch.lock().unwrap();
+        if scratch.len() != occ.len() {
+            scratch.clear();
+            scratch.reserve(occ.len());
+        }
+        scratch.clear();
+        scratch.extend(occ.iter().map(|&b| if b { 1u32 } else { 0u32 }));
+        // Drop the sim lock before touching wgpu so a slow submit does not
+        // block the physics tick thread waiting behind the render.
+        drop(sim);
+        renderer.render(&scratch, w, h_sz);
+    })
+}
+
+/// Return a JSON string with the adapter's identity fields so the
+/// diagnostic overlay in Kotlin can show what wgpu picked. Returns "{}"
+/// when no surface is bound. A JSON payload rather than a struct is chosen
+/// for the same reason `nativeSimStats` uses a flat double array: layout
+/// mismatches across Kotlin data classes and Rust structs silently ship
+/// wrong fields, and JSON puts the schema on both ends of one string.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimAdapterInfoJson<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    ptr: jlong,
+) -> jni::sys::jstring {
+    guard(std::ptr::null_mut(), || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let json = match unsafe { handle_from(ptr) } {
+            Some(h) => match h.renderer.lock().unwrap().as_ref() {
+                Some(r) => {
+                    let info = r.info();
+                    serde_json::json!({
+                        "name": info.name,
+                        "backend": info.backend,
+                        "driver": info.driver,
+                        "device_type": info.device_type,
+                    })
+                    .to_string()
+                }
+                None => "{}".to_string(),
+            },
+            None => "{}".to_string(),
+        };
+        match env.new_string(&json) {
+            Ok(js) => js.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 // ---------------------------------------------------------------- paint
@@ -300,13 +480,17 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimPaintEnd(
             return;
         }
         let mut sim = h.sim.lock().unwrap();
-        let _ = sim.paint_stroke(&s.points, &s.brush, true);
+        let report = sim.paint_stroke(&s.points, &s.brush, true);
         drop(sim);
         // Any new stroke resets the "energy drop" baseline so the UI shows
         // the settling that follows the paint, not one accumulated since sim
         // creation.
         let energy = h.sim.lock().unwrap().stats().energy;
-        h.telem.lock().unwrap().baseline_energy = energy;
+        let mut telem = h.telem.lock().unwrap();
+        telem.baseline_energy = energy;
+        telem.paint_cells_total = telem
+            .paint_cells_total
+            .saturating_add(report.painted_cells as u64);
     })
 }
 
@@ -524,7 +708,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadCmb(
 
 // ---------------------------------------------------------------- stats
 
-/// Returns a `double[9]` in the order Kotlin's `CoulombNative.Stats` expects:
+/// Returns a `double[10]` in the order Kotlin's `CoulombNative.Stats` expects:
 ///   [0] iteration           (whole-number double so no integer array is needed)
 ///   [1] particles
 ///   [2] temperature (K)
@@ -534,6 +718,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadCmb(
 ///   [6] occupancy fraction  (0..1) - lit sites over total lattice
 ///   [7] energy drop         (baseline_energy - current_energy, eV)
 ///   [8] batch size          (whole-number double)
+///   [9] paint cells total   (cumulative lattice cells touched by paint)
 ///
 /// A flat double[] is chosen over a `#[repr(C)]` struct because the JNI
 /// double-array primitive is cheap on both sides and does not require a
@@ -558,7 +743,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimStats<'a>(
             let drop = telem.baseline_energy - stats.energy;
             (occ, drop)
         };
-        let vals: [f64; 9] = [
+        let vals: [f64; 10] = [
             stats.iteration as f64,
             stats.particles as f64,
             stats.temperature,
@@ -568,6 +753,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimStats<'a>(
             occupancy,
             energy_drop,
             stats.batch as f64,
+            telem.paint_cells_total as f64,
         ];
         let arr: JDoubleArray = match env.new_double_array(vals.len() as i32) {
             Ok(a) => a,

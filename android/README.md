@@ -1,7 +1,8 @@
-# Coulomb Painter Android app (M3a)
+# Coulomb Painter Android app (M3a + M3b)
 
 The Compose UI shell for the Rust + wgpu physics core.
-M3a lands the app shell and JNI bridge without the on-device texture display; M3b wires the real render path when the reference S24 is available.
+M3a landed the app shell and JNI bridge without the on-device render.
+M3b (this landing) wires the wgpu Surface render path, the touch-to-paint pipeline, the adapter/thermal diagnostics overlay, and the on-device smoke script under `scripts/on-device-smoke.sh`.
 
 ## Prerequisites
 
@@ -96,11 +97,19 @@ android/
 - `cargo test -p coulomb-jni` passes on the host (from `rust/`).
 - `nm -D lib/arm64-v8a/libcoulomb_jni.so | grep Java_com_coulombpainter_CoulombNative_` lists the 20 JNI symbols.
 
-## Deferred to M3b (needs the S24)
+## M3b landed
 
-- SurfaceControl + wgpu texture display of the real physics frame.
-- Touch to paint pipeline (drag -> `nativeSimPaintStrokePoint` batch -> `nativeSimPaintEnd`).
-- `adb install` and real-device UI verification.
-- Thermal telemetry via `PowerManager.getThermalHeadroom`, battery-aware fps cap (M5).
-- `.cmb` save/load (M5), snapshot PNG encoder (M4).
+- `PhysicsSurface` composable hosts a `SurfaceView` via `AndroidView`; the SurfaceHolder callbacks drive `nativeSimBindSurface` / `nativeSimSurfaceResize` / `nativeSimUnbindSurface` and the render coroutine calls `nativeSimRenderFrame` on `Dispatchers.Default`.
+- Touch: `OnTouchListener` translates MotionEvent to lattice cells (same stretched-fill math as `projects/coulomb-brush/anneal_gui.py::frameToLattice`) and queues `paintBegin` / `paintPoint` / `paintEnd` on the VM's Default dispatcher.
+- Adapter, FPS, MPS, and thermal-headroom(10s) show in the diagnostic overlay togglable from Compute -> "show diagnostics".
+- `PowerManager.getThermalHeadroom(10)` is polled at 1 Hz from `MainActivity`; band crossings (>=0.5 / >=0.7 / >=0.85 / >=1.0) log to logcat under `CoulombThermal`. M5 will act on the reading.
+- `android/scripts/on-device-smoke.sh` runs the on-device checks with the Windows WADB adb.exe.
+
+## Deferred to later milestones
+
+- GPU-side physics (compute kernel on device): the M2 WGSL kernel is validated on desktop; the Android renderer creates its own wgpu device today, so the compute path needs a device merge and paint-on-GPU stroke porting. M3c.
+- Thermal-driven adaptive substeps (M5).
+- Battery-aware fps cap (M5).
+- `.cmb` save/load real implementation (M5).
+- Snapshot PNG encoder (M4).
 - Sideload update flow to GitHub Releases (M6).

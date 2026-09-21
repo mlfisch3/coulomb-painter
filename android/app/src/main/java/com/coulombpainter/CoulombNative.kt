@@ -1,5 +1,7 @@
 package com.coulombpainter
 
+import android.view.Surface
+
 /**
  * The Kotlin-side face of `libcoulomb_jni.so`.
  *
@@ -27,6 +29,23 @@ object CoulombNative {
     // ---- frame ----
     external fun nativeSimTick(handle: Long, iterations: Long): Long
     external fun nativeSimFrameTextureHandle(handle: Long): Long
+
+    // ---- surface (M3b) ----
+    /**
+     * Bind an AndroidExternalSurface's Surface to this sim's wgpu renderer.
+     * Returns true on success. See `rust/coulomb-jni/src/renderer.rs` for
+     * the ANativeWindow_fromSurface -> wgpu::Surface path.
+     */
+    external fun nativeSimBindSurface(handle: Long, surface: Surface): Boolean
+    external fun nativeSimUnbindSurface(handle: Long)
+    external fun nativeSimSurfaceResize(handle: Long, w: Long, h: Long)
+    external fun nativeSimRenderFrame(handle: Long)
+    /**
+     * A JSON payload with adapter identity - name, backend, driver,
+     * device_type - so the diagnostic overlay can show what wgpu picked
+     * on this specific device.
+     */
+    external fun nativeSimAdapterInfoJson(handle: Long): String?
 
     // ---- paint ----
     external fun nativeSimPaintBegin(handle: Long, sign: Double)
@@ -69,10 +88,11 @@ object CoulombNative {
         val occupancy: Double,
         val energyDrop: Double,
         val batch: Long,
+        val paintCells: Long,
     ) {
         companion object {
             fun from(arr: DoubleArray?): Stats? {
-                if (arr == null || arr.size < 9) return null
+                if (arr == null || arr.size < 10) return null
                 return Stats(
                     iteration = arr[0].toLong(),
                     particles = arr[1].toLong(),
@@ -83,6 +103,7 @@ object CoulombNative {
                     occupancy = arr[6],
                     energyDrop = arr[7],
                     batch = arr[8].toLong(),
+                    paintCells = arr[9].toLong(),
                 )
             }
         }
