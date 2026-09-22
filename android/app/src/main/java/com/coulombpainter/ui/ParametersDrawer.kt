@@ -13,6 +13,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.foundation.rememberScrollState
@@ -53,6 +57,7 @@ fun ParametersDrawer(
     onHelp: (String) -> Unit,
     showDiagnostics: Boolean = false,
     onToggleDiagnostics: (Boolean) -> Unit = {},
+    onNewCanvas: () -> Unit = {},
     onResetCanvas: () -> Unit = {},
 ) {
     ModalDrawerSheet(
@@ -73,23 +78,23 @@ fun ParametersDrawer(
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
             )
-            // Firstmate bug #7: Reset canvas at the top of the drawer.
-            // Confirmation dialog lives in CoulombPainterApp; this row
-            // only asks for it.
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { onResetCanvas() }
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "Reset canvas",
-                    color = CpAccent,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                )
-            }
+            // Captain split: 'New canvas' rebuilds from scratch (opens the
+            // New Canvas dialog with resolution, aspect, fill fraction);
+            // 'Reset canvas' keeps the current params but re-seeds charges
+            // and clears the painted layer. Distinct icons per captain: Add
+            // for creating a fresh canvas, Refresh for reseeding.
+            MenuRow(
+                icon = Icons.Filled.Add,
+                iconDescription = "New canvas",
+                label = "New canvas",
+                onClick = onNewCanvas,
+            )
+            MenuRow(
+                icon = Icons.Filled.Refresh,
+                iconDescription = "Reset canvas",
+                label = "Reset canvas",
+                onClick = onResetCanvas,
+            )
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -286,6 +291,31 @@ private fun ParamRow(
     }
 }
 
+
+@Composable
+private fun MenuRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    iconDescription: String,
+    label: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Icon(icon, contentDescription = iconDescription, tint = CpAccent)
+        Text(
+            label,
+            color = CpAccent,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
+        )
+    }
+}
 
 @Composable
 private fun HelpChip(onClick: () -> Unit) {

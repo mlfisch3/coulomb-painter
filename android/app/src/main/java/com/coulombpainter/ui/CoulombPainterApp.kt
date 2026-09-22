@@ -96,6 +96,7 @@ fun CoulombPainterApp(vm: SimViewModel) {
                 onHelp = { helpTopic = it },
                 showDiagnostics = showDiagnostics,
                 onToggleDiagnostics = { vm.setShowDiagnostics(it) },
+                onNewCanvas = { showNewCanvasDialog = true },
                 onResetCanvas = { showResetCanvasDialog = true },
             )
         },
@@ -146,7 +147,12 @@ fun CoulombPainterApp(vm: SimViewModel) {
     if (showNewCanvasDialog) {
         NewCanvasDialog(
             onDismiss = { showNewCanvasDialog = false },
-            onConfirm = { showNewCanvasDialog = false },
+            onConfirm = {
+                // Real rebuild lands with M4; for now the dialog just closes
+                // and takes the drawer with it, matching the reset flow.
+                showNewCanvasDialog = false
+                coroutineScope.launch { drawerState.close() }
+            },
         )
     }
     if (showResetCanvasDialog) {
