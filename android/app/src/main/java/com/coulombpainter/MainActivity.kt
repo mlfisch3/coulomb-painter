@@ -1,6 +1,9 @@
 package com.coulombpainter
 
+import android.content.Context
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -22,6 +25,17 @@ class MainActivity : ComponentActivity() {
         // fixed at 0 so a fresh launch always reproduces the same starting
         // arrangement; M4 exposes it through the New Canvas dialog.
         simVm.ensureCreated(h = 512, w = 512, seed = 0L, nParticles = 40_000)
+
+        // Thermal telemetry: forecast headroom 10 s out. Available on API 30
+        // (Android 11) and above; the app supports minSdk 26, so pre-30
+        // devices see NaN and no logs. M3b observes only; M5 will feed the
+        // signal into the physics substep count.
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        simVm.startThermalObserver { forecastSeconds ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                powerManager.getThermalHeadroom(forecastSeconds)
+            } else null
+        }
 
         setContent {
             CoulombPainterTheme {
