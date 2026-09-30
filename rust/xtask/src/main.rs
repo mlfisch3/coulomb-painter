@@ -136,6 +136,9 @@ fn android_build() -> Result<(), String> {
     // via `minSdk = 26`. Without an explicit platform, `cargo ndk` defaults
     // to API 21, whose sysroot pre-dates `libnativewindow.so` / `libaaudio.so`
     // and the ndk crate's `all` feature refuses to link.
+    // x86 is included so an x86 emulator (the common Windows/WSL host without
+    // an ARM-translation image) can load the JNI library. arm64 remains the
+    // hardware ABI the S24 Ultra reference device uses.
     let status = Command::new("cargo")
         .current_dir(&root)
         .args([
@@ -146,6 +149,10 @@ fn android_build() -> Result<(), String> {
             "arm64-v8a",
             "-t",
             "armeabi-v7a",
+            "-t",
+            "x86",
+            "-t",
+            "x86_64",
             "build",
             "--release",
             "-p",
@@ -164,6 +171,8 @@ fn android_build() -> Result<(), String> {
     let outputs = [
         ("aarch64-linux-android", "arm64-v8a"),
         ("armv7-linux-androideabi", "armeabi-v7a"),
+        ("i686-linux-android", "x86"),
+        ("x86_64-linux-android", "x86_64"),
     ];
     // libcoulomb_jni.so is the only .so actually loaded by System.loadLibrary
     // in the app: it re-exports what it uses from coulomb-core and coulomb-gpu
