@@ -1129,6 +1129,82 @@ impl Sim {
         self.params.temperature = t;
     }
 
+    /// Live setter for a named scalar parameter.
+    ///
+    /// Categories mirror the desktop reference's `LIVE_KEYS` / `REBUILD_KEYS`
+    /// split: keys whose meaning is a scalar the batch-Metropolis loop reads
+    /// each iteration land straight into `Params`; keys that change the
+    /// interaction kernel or the periodic-vs-hard-wall boundary rebuild the
+    /// kernel and re-project the paint layer onto `u_edge` before the next
+    /// step. Unknown or non-live keys return `false` and change nothing.
+    pub fn set_param(&mut self, key: &str, value: f64) -> bool {
+        // A change to any of these shapes the interaction kernel or the
+        // boundary handling, so rebuilding it is not optional.
+        let rebuild = matches!(
+            key,
+            "strength" | "screening" | "cutoff" | "periodic"
+                | "attract_depth" | "attract_range"
+        );
+        match key {
+            "temperature" => self.params.temperature = value,
+            "charge" => self.params.charge = value,
+            "batch" => {
+                let v = value.max(1.0) as usize;
+                self.params.batch = v;
+                // The live batch may currently be below the new nominal batch
+                // because the fail-streak policy shrank it; jump it up so a
+                // slider raise is felt immediately.
+                if self.live_batch < v {
+                    self.live_batch = v;
+                }
+            }
+            "batch_min" => self.params.batch_min = value.max(1.0) as usize,
+            "batch_decrement" => self.params.batch_decrement = value.max(1.0) as usize,
+            "fail_limit" => self.params.fail_limit = value.max(1.0) as usize,
+            "step_size" => self.params.step_size = value.round().max(1.0) as i32,
+            "strength" => self.params.strength = value,
+            "screening" => self.params.screening = value.max(0.0),
+            "cutoff" => self.params.cutoff = value.max(1.0),
+            "periodic" => self.params.periodic = value != 0.0,
+            "attract_depth" => self.params.attract_depth = value,
+            "attract_range" => self.params.attract_range = value.max(0.0),
+            _ => return false,
+        }
+        if rebuild {
+            self.rebuild_interaction();
+        }
+        true
+    }
+
+    /// Rebuild the interaction kernel and re-project `u_edge` from the
+    /// coverage-and-paint sources. Called after any REBUILD_KEYS change.
+    /// Cheaper than a whole `Sim::new` because occupancy, positions, blocked
+    /// masks and undo history are all kept in place - only the interaction
+    /// geometry moves.
+    pub fn rebuild_interaction(&mut self) {
+        let (rc, kernel) = build_kernel(&self.params, true);
+        let (_rc2, kernel_edge) = build_kernel(&self.params, false);
+        self.rc = rc;
+        self.kernel = kernel;
+        self.kernel_edge = kernel_edge;
+        // Re-project line coverage + paint into the fresh edge kernel. Keeping
+        // paint alive across a cutoff bump is important: a stroke drawn at
+        // cutoff=8 should not evaporate the moment the artist tries cutoff=12.
+        let mut edge = vec![0.0f64; self.cov.len()];
+        for i in 0..edge.len() {
+            edge[i] = self.cov[i] * self.line_density + self.paint[i];
+        }
+        self.u_edge = convolve(
+            &edge,
+            self.params.h,
+            self.params.w,
+            &self.kernel_edge,
+            self.rc,
+            self.params.periodic,
+        );
+        self.energy = self.total_energy();
+    }
+
     pub fn occupancy(&self) -> &[bool] {
         &self.occ
     }

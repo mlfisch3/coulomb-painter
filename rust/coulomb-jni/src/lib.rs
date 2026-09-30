@@ -41,6 +41,12 @@ struct SimHandle {
     telem: Mutex<Telemetry>,
     paused: Mutex<bool>,
 
+    // Latest brush settings pushed from Kotlin. paint_begin snapshots this
+    // into the in-flight stroke, so the whole `Brush` (thickness, hardness,
+    // coupling, …) reaches the physics kernel instead of a hard-coded
+    // `Brush::default()` that lost every value the artist set.
+    brush: Mutex<Brush>,
+
     // The current stroke's brush and points, buffered between paint_begin and
     // paint_end. Kotlin passes touch events one at a time; the physics kernel
     // batches a stroke into one incremental patch update at end-of-stroke.
@@ -98,6 +104,7 @@ impl SimHandle {
                 paint_cells_total: 0,
             }),
             paused: Mutex::new(false),
+            brush: Mutex::new(Brush::default()),
             stroke: Mutex::new(None),
             renderer: Mutex::new(None),
             occ_scratch: Mutex::new(Vec::new()),
@@ -450,9 +457,50 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimPaintBegin
             return;
         };
         let _ = &mut env; // reserved for a future brush-json override arg.
-        let mut brush = Brush::default();
+        // Snapshot the persistent brush the Kotlin UI keeps mirrored via
+        // `nativeSimSetBrush`, so thickness / hardness / coupling / etc.
+        // reach `paint_stroke` instead of the fat-line `Brush::default()`
+        // that ignored every knob the artist set.
+        let mut brush = h.brush.lock().unwrap().clone();
         brush.sign = if sign >= 0.0 { 1.0 } else { -1.0 };
         *h.stroke.lock().unwrap() = Some(InFlightStroke { brush, points: Vec::new() });
+    })
+}
+
+/// Push the current brush shape into the handle. `sign` is applied per stroke
+/// at `paint_begin` time, so callers pass whatever sign they last showed the
+/// user and it is fine for the two calls to disagree.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetBrush(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    magnitude: jdouble,
+    density: jdouble,
+    thickness: jdouble,
+    flow: jdouble,
+    hardness: jdouble,
+    penetrability: jdouble,
+    coupling: jdouble,
+) {
+    guard((), || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return;
+        };
+        // The clamps mirror `brush.Brush.from_params` in the desktop reference:
+        // a zero-thickness brush would paint no cell, and a hardness of 1.5
+        // makes no sense. Clamp here so a slider bug in Kotlin cannot poison
+        // the physics kernel.
+        let mut b = Brush::default();
+        b.magnitude = magnitude;
+        b.density = density;
+        b.thickness = thickness.max(1.0);
+        b.flow = flow;
+        b.hardness = hardness.clamp(0.0, 1.0);
+        b.penetrability = penetrability.clamp(0.0, 1.0);
+        b.coupling = coupling.max(1.0);
+        *h.brush.lock().unwrap() = b;
     })
 }
 
@@ -795,13 +843,11 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimStats<'a>(
 // ---------------------------------------------------------------- helpers
 
 fn apply_param(sim: &mut Sim, key: String, value: f64) {
-    // Temperature is the only live-mutable param the CPU core exposes
-    // directly; the rest require a rebuild, so M3a only accepts temperature
-    // (which is what the auto-T slider drives) and defers the wider surface
-    // to M4 when the drawer is wired up.
-    if key == "temperature" {
-        sim.set_temperature(value);
-    }
+    // Delegates to the core's typed setter, which knows which keys are live
+    // and which trigger a kernel rebuild. An unknown key returns false and
+    // silently no-ops here - the drawer sends best-effort JSON, so a stray
+    // decorative field must not fail the whole update batch.
+    let _ = sim.set_param(&key, value);
 }
 
 fn read_param(sim: &Sim, key: &str) -> f64 {

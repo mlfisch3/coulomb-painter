@@ -53,6 +53,23 @@ object CoulombNative {
     external fun nativeSimPaintEnd(handle: Long)
     external fun nativeSimUndo(handle: Long): Boolean
     external fun nativeSimClearPaint(handle: Long)
+    /**
+     * Push the artist's current brush shape into the native side so the next
+     * `nativeSimPaintBegin` snapshot picks it up. Without this the physics
+     * kernel would fall back to `Brush::default()` (the fat-line default)
+     * regardless of what the user set on the slider - the M3b bug the captain
+     * called out on the S24.
+     */
+    external fun nativeSimSetBrush(
+        handle: Long,
+        magnitude: Double,
+        density: Double,
+        thickness: Double,
+        flow: Double,
+        hardness: Double,
+        penetrability: Double,
+        coupling: Double,
+    )
 
     // ---- params ----
     external fun nativeSimSetParam(handle: Long, key: String, value: Double)

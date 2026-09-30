@@ -86,6 +86,11 @@ class SimViewModel : ViewModel() {
         handle = CoulombNative.nativeSimCreate(h.toLong(), w.toLong(), seed, nParticles.toLong())
         if (handle == 0L) return
         _lattice.value = h
+        // Push the artist's current brush and params into the fresh handle so
+        // an app-update or activity recreate does not silently reset the
+        // brush to the fat-line default or the interaction cutoff to 12.
+        pushBrushToNative()
+        pushParamsToNative()
         startLoops()
     }
 
@@ -242,6 +247,12 @@ class SimViewModel : ViewModel() {
         if (handle == 0L) return
         viewModelScope.launch(Dispatchers.Default) {
             CoulombNative.nativeSimLoadPreset(handle, "blank")
+            // A preset load rebuilds the sim from `Params::default()` plus
+            // the current geometry, which resets the interaction cutoff etc.
+            // Push the artist's live tuning back onto the fresh handle so a
+            // Reset canvas does not silently discard slider positions.
+            pushBrushToNative()
+            pushParamsToNative()
             // Reset baseline energy so the "energy drop" telemetry does
             // not stay pinned to the pre-reset baseline. Cheap since it
             // just reads current stats.
@@ -259,7 +270,78 @@ class SimViewModel : ViewModel() {
 
     fun setMode(m: Mode) { _mode.value = m }
 
-    fun setBrush(b: BrushSettings) { _brush.value = b }
+    /**
+     * Update the artist's brush and push every field into the native handle.
+     *
+     * Before firstmate bug #10 this only updated the Kotlin state; the native
+     * side kept using `Brush::default()` for every stroke, which the captain
+     * hit on the S24 as "the brush creates fat lines no matter what I try."
+     * Pushing on every change means a slider drag is reflected on the very
+     * next `ACTION_DOWN`.
+     */
+    fun setBrush(b: BrushSettings) {
+        _brush.value = b
+        if (handle != 0L) {
+            CoulombNative.nativeSimSetBrush(
+                handle,
+                b.magnitude,
+                b.density,
+                b.thickness,
+                b.flow,
+                b.hardness,
+                b.penetrability,
+                b.coupling,
+            )
+        }
+    }
+
+    /**
+     * Push the current brush shape after the native handle is (re)created.
+     * Called from `ensureCreated` and after a reset so the very first stroke
+     * uses the artist's values, not `Brush::default()`.
+     */
+    private fun pushBrushToNative() {
+        if (handle == 0L) return
+        val b = _brush.value
+        CoulombNative.nativeSimSetBrush(
+            handle,
+            b.magnitude,
+            b.density,
+            b.thickness,
+            b.flow,
+            b.hardness,
+            b.penetrability,
+            b.coupling,
+        )
+    }
+
+    /**
+     * Push every live-mutable parameter into the native handle. Called after
+     * `nativeSimCreate` so a persisted `ParamsSnapshot` from a previous
+     * session survives the app restart, and after a `Reset canvas` so the
+     * fresh `Sim` keeps the artist's tuning.
+     */
+    private fun pushParamsToNative() {
+        if (handle == 0L) return
+        val p = _params.value
+        pushOne("temperature", p.temperature)
+        pushOne("charge", p.charge)
+        pushOne("strength", p.strength)
+        pushOne("screening", p.screening)
+        pushOne("cutoff", p.cutoff)
+        pushOne("attract_depth", p.attractDepth)
+        pushOne("attract_range", p.attractRange)
+        pushOne("batch", p.batch.toDouble())
+        pushOne("batch_min", p.batchMin.toDouble())
+        pushOne("batch_decrement", p.batchDecrement.toDouble())
+        pushOne("fail_limit", p.failLimit.toDouble())
+        pushOne("step_size", p.stepSize.toDouble())
+        pushOne("periodic", if (p.periodic) 1.0 else 0.0)
+    }
+
+    private fun pushOne(key: String, value: Double) {
+        CoulombNative.nativeSimSetParam(handle, key, value)
+    }
 
     fun setParam(key: String, value: Double) {
         // M3a exposes only temperature as live-mutable; the drawer surfaces
@@ -354,6 +436,12 @@ data class ParamsSnapshot(
         "charge" -> copy(charge = value)
         "attract_depth" -> copy(attractDepth = value)
         "attract_range" -> copy(attractRange = value)
+        "batch" -> copy(batch = value.toInt().coerceAtLeast(1))
+        "batch_min" -> copy(batchMin = value.toInt().coerceAtLeast(1))
+        "batch_decrement" -> copy(batchDecrement = value.toInt().coerceAtLeast(1))
+        "fail_limit" -> copy(failLimit = value.toInt().coerceAtLeast(1))
+        "step_size" -> copy(stepSize = value.toInt().coerceAtLeast(1))
+        "periodic" -> copy(periodic = value != 0.0)
         else -> this
     }
 }
