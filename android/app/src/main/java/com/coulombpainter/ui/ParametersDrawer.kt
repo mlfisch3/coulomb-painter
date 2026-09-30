@@ -12,11 +12,14 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.foundation.rememberScrollState
@@ -24,6 +27,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -45,10 +49,13 @@ import com.coulombpainter.ui.theme.CpPanel
 import com.coulombpainter.ui.theme.CpPanel2
 
 /**
- * Accordion drawer that lists every desktop param group. M3a shows the whole
- * surface so the layout is judgeable; individual controls become live in M4
- * as the parameter routing matures. Every row has a `?` chip so the help
- * pattern is set now, not retrofitted later.
+ * Accordion drawer that lists every desktop param group.
+ *
+ * M3c wires the sliders through: temperature was live in M3b, the rest
+ * (interaction, short-range attraction, annealing scalars, boundary) reach
+ * the physics kernel via `nativeSimSetParam` / the core's `set_param`. Rows
+ * that need a full rebuild (image, resolution, fill, line-blocking) still
+ * open the New Canvas dialog because the sim's shape has to change.
  */
 @Composable
 fun ParametersDrawer(
@@ -59,6 +66,7 @@ fun ParametersDrawer(
     onToggleDiagnostics: (Boolean) -> Unit = {},
     onNewCanvas: () -> Unit = {},
     onResetCanvas: () -> Unit = {},
+    onClose: () -> Unit = {},
 ) {
     ModalDrawerSheet(
         drawerContainerColor = CpPanel,
@@ -71,13 +79,37 @@ fun ParametersDrawer(
                 .verticalScroll(rememberScrollState())
                 .padding(vertical = 12.dp),
         ) {
-            Text(
-                "Coulomb Painter",
-                color = CpInk,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-            )
+            // Captain report: on the S24 there was no way to close the drawer
+            // once opened (gesturesEnabled=false at the parent, plus no visible
+            // dismiss affordance). An X in the upper-right corner does the
+            // Compose thing (drawerState.close via `onClose`) and takes the
+            // whole drawer with it. `Icons.Filled.Close` is deliberately not
+            // reused anywhere else in the app - per captain rule "no icon may
+            // mean two things".
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Coulomb Painter",
+                    color = CpInk,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+                IconButton(
+                    onClick = onClose,
+                    modifier = Modifier.size(32.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.Close,
+                        contentDescription = "Close panel",
+                        tint = CpInk,
+                    )
+                }
+            }
             // Captain split: 'New canvas' rebuilds from scratch (opens the
             // New Canvas dialog with resolution, aspect, fill fraction);
             // 'Reset canvas' keeps the current params but re-seeds charges
@@ -109,61 +141,131 @@ fun ParametersDrawer(
                     onHelp = { onHelp("source.line_density") })
                 ParamRow("line blocks particles", "on", onHelp = { onHelp("source.line_blocks") })
                 ParamRow("line threshold", "0.50", onHelp = { onHelp("source.threshold") })
-                ParamRow("periodic boundary", if (params.periodic) "on" else "off",
-                    onHelp = { onHelp("source.periodic") })
+                ParamRow(
+                    key = "periodic boundary",
+                    value = if (params.periodic) "on" else "off",
+                    onHelp = { onHelp("source.periodic") },
+                    onClickValue = { onParamChange("periodic", if (params.periodic) 0.0 else 1.0) },
+                )
             }
             AccordionGroup(title = "Mobile charges", initiallyOpen = false) {
                 ParamRow("initial fill", "0.35", onHelp = { onHelp("mobile.fill") })
-                ParamRow("charge per particle", "%.2f".format(params.charge),
-                    onHelp = { onHelp("mobile.charge") })
+                LiveSlider(
+                    label = "charge per particle",
+                    value = params.charge,
+                    range = 0.1f..5.0f,
+                    key = "charge",
+                    onHelp = { onHelp("mobile.charge") },
+                    onCommit = onParamChange,
+                )
             }
             AccordionGroup(title = "Interaction", initiallyOpen = false) {
-                ParamRow("strength", "%.2f".format(params.strength),
-                    onHelp = { onHelp("interaction.strength") })
-                ParamRow("screening length", "%.2f".format(params.screening),
-                    onHelp = { onHelp("interaction.screening") })
-                ParamRow("cutoff", "%.1f".format(params.cutoff),
-                    onHelp = { onHelp("interaction.cutoff") })
+                LiveSlider(
+                    label = "strength",
+                    value = params.strength,
+                    range = 0.0f..5.0f,
+                    key = "strength",
+                    onHelp = { onHelp("interaction.strength") },
+                    onCommit = onParamChange,
+                )
+                LiveSlider(
+                    label = "screening length",
+                    value = params.screening,
+                    range = 0.0f..32.0f,
+                    key = "screening",
+                    onHelp = { onHelp("interaction.screening") },
+                    onCommit = onParamChange,
+                )
+                LiveSlider(
+                    label = "cutoff",
+                    value = params.cutoff,
+                    range = 1.0f..24.0f,
+                    key = "cutoff",
+                    onHelp = { onHelp("interaction.cutoff") },
+                    onCommit = onParamChange,
+                )
             }
             AccordionGroup(title = "Short-range attraction", initiallyOpen = false) {
-                ParamRow("well depth", "%.2f".format(params.attractDepth),
-                    onHelp = { onHelp("attract.depth") })
-                ParamRow("range", "%.2f".format(params.attractRange),
-                    onHelp = { onHelp("attract.range") })
+                LiveSlider(
+                    label = "well depth",
+                    value = params.attractDepth,
+                    range = 0.0f..5.0f,
+                    key = "attract_depth",
+                    onHelp = { onHelp("attract.depth") },
+                    onCommit = onParamChange,
+                )
+                LiveSlider(
+                    label = "range",
+                    value = params.attractRange,
+                    range = 0.5f..8.0f,
+                    key = "attract_range",
+                    onHelp = { onHelp("attract.range") },
+                    onCommit = onParamChange,
+                )
             }
             AccordionGroup(title = "Annealing", initiallyOpen = true) {
-                ParamRow("temperature (K)", "%.0f".format(params.temperature),
-                    onHelp = { onHelp("anneal.temperature") })
-                // Live slider for the one param the CPU core exposes as
-                // live-mutable (apply_param in coulomb-jni/src/lib.rs). The
-                // Log.d line proves the JNI hop happened, per firstmate bug
-                // #3. The drag range is 100 K to 200 kK; the desktop
-                // reference spans the same interval.
-                TempSliderRow(
+                LiveSlider(
+                    label = "temperature (K)",
                     value = params.temperature,
-                    onValueChangeFinished = { v ->
-                        Log.d("CoulombPainter", "param temperature set to $v")
-                        onParamChange("temperature", v)
+                    range = 100f..200_000f,
+                    key = "temperature",
+                    onHelp = { onHelp("anneal.temperature") },
+                    onCommit = { k, v ->
+                        Log.d("CoulombPainter", "param $k set to $v")
+                        onParamChange(k, v)
                     },
                 )
+                // Cooling active + schedule + rate are decorative for now
+                // (the core has no cooling schedule of its own - temperature
+                // moves only when the artist sets it or auto-T probes).
                 ParamRow("cooling active", if (params.coolingActive) "on" else "off",
                     onHelp = { onHelp("anneal.cooling_active") })
                 ParamRow("schedule", params.schedule,
                     onHelp = { onHelp("anneal.schedule") })
                 ParamRow("cooling rate / 1000", "%.2f".format(params.coolingRate),
                     onHelp = { onHelp("anneal.rate") })
-                ParamRow("batch", params.batch.toString(),
-                    onHelp = { onHelp("anneal.batch") })
-                ParamRow("batch_min", params.batchMin.toString(),
-                    onHelp = { onHelp("anneal.batch_min") })
-                ParamRow("batch_decrement", params.batchDecrement.toString(),
-                    onHelp = { onHelp("anneal.batch_decrement") })
-                ParamRow("fail_limit", params.failLimit.toString(),
-                    onHelp = { onHelp("anneal.fail_limit") })
+                LiveSlider(
+                    label = "batch",
+                    value = params.batch.toDouble(),
+                    range = 1f..256f,
+                    key = "batch",
+                    onHelp = { onHelp("anneal.batch") },
+                    onCommit = onParamChange,
+                )
+                LiveSlider(
+                    label = "batch_min",
+                    value = params.batchMin.toDouble(),
+                    range = 1f..64f,
+                    key = "batch_min",
+                    onHelp = { onHelp("anneal.batch_min") },
+                    onCommit = onParamChange,
+                )
+                LiveSlider(
+                    label = "batch_decrement",
+                    value = params.batchDecrement.toDouble(),
+                    range = 1f..32f,
+                    key = "batch_decrement",
+                    onHelp = { onHelp("anneal.batch_decrement") },
+                    onCommit = onParamChange,
+                )
+                LiveSlider(
+                    label = "fail_limit",
+                    value = params.failLimit.toDouble(),
+                    range = 1f..64f,
+                    key = "fail_limit",
+                    onHelp = { onHelp("anneal.fail_limit") },
+                    onCommit = onParamChange,
+                )
             }
             AccordionGroup(title = "Compute", initiallyOpen = false) {
-                ParamRow("step size", params.stepSize.toString(),
-                    onHelp = { onHelp("compute.step_size") })
+                LiveSlider(
+                    label = "step size",
+                    value = params.stepSize.toDouble(),
+                    range = 1f..8f,
+                    key = "step_size",
+                    onHelp = { onHelp("compute.step_size") },
+                    onCommit = onParamChange,
+                )
                 ParamRow("gpu backend", "wgpu (Vulkan)",
                     onHelp = { onHelp("compute.backend") })
                 ParamRow(
@@ -190,11 +292,6 @@ fun ParametersDrawer(
             )
         }
     }
-    // The onParamChange parameter is kept in the signature so M4 can wire a
-    // slider row here without a call-site change. It is intentionally unused
-    // in M3a; the drawer is a layout-check surface first.
-    @Suppress("UNUSED_EXPRESSION")
-    onParamChange
 }
 
 @Composable
@@ -235,22 +332,58 @@ private fun AccordionGroup(
     }
 }
 
+/**
+ * A slider row that only fires `onCommit` at drag end. Every slider in the
+ * drawer uses this so the physics kernel is not rebuilt (cutoff, strength,
+ * screening, attract_*) on every intermediate frame of a drag.
+ *
+ * `draft` follows the finger so the label updates while dragging, but the
+ * physics is only touched when the user releases. Matches the desktop
+ * reference's LIVE_KEYS / REBUILD_KEYS split.
+ */
 @Composable
-private fun TempSliderRow(
+private fun LiveSlider(
+    label: String,
     value: Double,
-    onValueChangeFinished: (Double) -> Unit,
+    range: ClosedFloatingPointRange<Float>,
+    key: String,
+    onHelp: () -> Unit,
+    onCommit: (String, Double) -> Unit,
 ) {
-    var draft by remember { mutableStateOf(value.toFloat()) }
+    var draft by remember(value) { mutableStateOf(value.toFloat()) }
+    // If the source of truth moves (Reset canvas, external update), sync the
+    // slider so it does not lie about the current physics state.
+    LaunchedEffect(value) {
+        draft = value.toFloat()
+    }
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = 24.dp, end = 16.dp, top = 2.dp, bottom = 8.dp),
+            .padding(start = 24.dp, end = 12.dp, top = 4.dp, bottom = 6.dp),
     ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                label,
+                color = CpDim,
+                fontSize = 12.sp,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                if (draft >= 100f) "%.0f".format(draft) else "%.2f".format(draft),
+                color = CpInk,
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace,
+            )
+            HelpChip(onHelp)
+        }
         Slider(
             value = draft,
             onValueChange = { draft = it },
-            onValueChangeFinished = { onValueChangeFinished(draft.toDouble()) },
-            valueRange = 100f..200_000f,
+            onValueChangeFinished = { onCommit(key, draft.toDouble()) },
+            valueRange = range,
             colors = SliderDefaults.colors(
                 thumbColor = CpAccent,
                 activeTrackColor = CpAccent.copy(alpha = 0.6f),

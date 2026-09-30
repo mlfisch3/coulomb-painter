@@ -98,6 +98,11 @@ fun CoulombPainterApp(vm: SimViewModel) {
                 onToggleDiagnostics = { vm.setShowDiagnostics(it) },
                 onNewCanvas = { showNewCanvasDialog = true },
                 onResetCanvas = { showResetCanvasDialog = true },
+                // Close-X in the drawer header: without gestures the artist
+                // previously had no way off this panel. The X sits at the
+                // top-right per captain report and closes the drawer via the
+                // same DrawerState the hamburger opens.
+                onClose = { coroutineScope.launch { drawerState.close() } },
             )
         },
     ) {

@@ -50,6 +50,8 @@ fun DiagnosticOverlay(vm: SimViewModel, onDismiss: () -> Unit) {
     val fps by vm.fps.collectAsState()
     val adapter by vm.adapter.collectAsState()
     val thermal by vm.thermal.collectAsState()
+    val brush by vm.brush.collectAsState()
+    val params by vm.params.collectAsState()
 
     Box(
         modifier = Modifier
@@ -101,6 +103,26 @@ fun DiagnosticOverlay(vm: SimViewModel, onDismiss: () -> Unit) {
                 Row(modifier = Modifier.fillMaxWidth()) {
                     KVLabel("thermal(10s)")
                     KVValue(formatHeadroom(thermal.headroom))
+                }
+                // Brush shape reaching the physics kernel. Before M3c this
+                // row would have lied - `nativeSimSetBrush` did not exist and
+                // the native side always used `Brush::default()`. The values
+                // shown here now match what `paint_stroke` sees.
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    KVLabel("brush thick")
+                    KVValue("%.1f cells".format(brush.thickness))
+                }
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    KVLabel("brush hard")
+                    KVValue("%.2f".format(brush.hardness))
+                }
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    KVLabel("brush coupl")
+                    KVValue("%.1f cells".format(brush.coupling))
+                }
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    KVLabel("cutoff")
+                    KVValue("%.1f".format(params.cutoff))
                 }
                 Text(
                     "Tap outside to close. Thermal >=1.0 means throttle is imminent (M5 will act).",
