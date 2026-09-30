@@ -1,0 +1,5 @@
+scenario: T200k: hot batch-Metropolis, 128x128, no paint
+stage-by-stage comparison:
+stage      T (K)    acc cpu     acc py   <E> cpu (eV)    <E> py (eV)
+    0   200000.0     0.9893     0.9889       1.3325e3       1.3220e3
+pass

@@ -1,0 +1,5 @@
+scenario: T10k: cold batch-Metropolis, 128x128, with short-range attraction
+stage-by-stage comparison:
+stage      T (K)    acc cpu     acc py   <E> cpu (eV)    <E> py (eV)
+    0    10000.0     0.9282     0.9284       3.6303e2       3.6173e2
+pass
