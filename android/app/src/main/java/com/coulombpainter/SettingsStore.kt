@@ -103,7 +103,6 @@ object SettingsStore {
         put("hardness", b.hardness)
         put("penetrability", b.penetrability)
         put("coupling", b.coupling)
-        put("budget", b.budget)
     }
 
     private fun brushFromJson(src: String): BrushSettings? = try {
@@ -118,7 +117,6 @@ object SettingsStore {
             hardness = o.optDouble("hardness", d.hardness),
             penetrability = o.optDouble("penetrability", d.penetrability),
             coupling = o.optDouble("coupling", d.coupling),
-            budget = o.optDouble("budget", d.budget),
         )
     } catch (e: JSONException) {
         Log.w(TAG, "brush json malformed: ${e.message}")
