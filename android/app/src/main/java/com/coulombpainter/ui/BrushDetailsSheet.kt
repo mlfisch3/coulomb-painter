@@ -72,8 +72,8 @@ fun BrushDetailsSheet(
             BrushRow("coupling (px)", brush.coupling, 1.0..64.0,
                 onHelp = { onHelp("brush.coupling") },
                 onChange = { onChange(brush.copy(coupling = it)) })
-            // Firstmate bug #8: one-tap restore of every brush field to
-            // the defaults `projects/coulomb-brush` ships with, which are
+            // One-tap restore of every brush field to the defaults the
+            // Coulomb Brush reference implementation ships with, which are
             // what `BrushSettings()` (the no-arg constructor) returns.
             Row(
                 modifier = Modifier

@@ -16,8 +16,8 @@ The full plan and per-milestone exit criteria are in `docs/android-plan.md`; rea
 
 ## Physics reference
 
-The desktop annealer whose physics this project ports lives outside this repository, in the fleet-managed sibling `projects/coulomb-brush/` (Python + optional CUDA).
-The Rust validator finds it at `$COULOMB_REFERENCE` or the default `/home/drd/PROJECT/CLAUDE/FM-COULOMB/fm-coulomb/projects/coulomb-brush`.
+The desktop annealer whose physics this project ports (the Coulomb Brush reference implementation, Python + optional CUDA) lives outside this repository.
+The Rust validator finds it via the `$COULOMB_REFERENCE` environment variable, or the sibling-directory default `../coulomb-brush` relative to this repo's root.
 Do not edit that reference from this repository; it is read-only for us.
 
 ## Validation approach

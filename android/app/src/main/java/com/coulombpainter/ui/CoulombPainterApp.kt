@@ -174,10 +174,10 @@ fun CoulombPainterApp(vm: SimViewModel) {
 
     ModalNavigationDrawer(
         drawerState = drawerState,
-        // Firstmate bug #1: edge-swipe on the canvas otherwise opens the
-        // drawer and swallows any right-going paint stroke. The hamburger
-        // icon is the only way in now; a right-drag on the canvas reaches
-        // the paint pipeline.
+        // Edge-swipe on the canvas would otherwise open the drawer and
+        // swallow any right-going paint stroke. The hamburger icon is the
+        // only way in now; a right-drag on the canvas reaches the paint
+        // pipeline.
         gesturesEnabled = false,
         drawerContent = {
             ParametersDrawer(
@@ -276,9 +276,9 @@ fun CoulombPainterApp(vm: SimViewModel) {
                     PhysicsSurface(
                         vm = vm,
                         lattice = lattice,
-                        // Firstmate bug #2: refuse touches when the drawer
-                        // is open, so the tap that dismisses the drawer is
-                        // not also read as a paint stroke.
+                        // Refuse touches when the drawer is open, so the
+                        // tap that dismisses the drawer is not also read
+                        // as a paint stroke.
                         touchEnabled = !drawerIsOpen,
                         modifier = Modifier.fillMaxSize(),
                     )
@@ -448,10 +448,11 @@ private fun TopBar(
     // Top bar honours WindowInsets.statusBars so the icons are not under
     // the notch. Canvas stays edge-to-edge behind it.
     //
-    // Firstmate bug #5: no lightning-bolt icons anywhere. The former "New
-    // canvas" bolt is gone (Reset canvas now lives in the hamburger menu);
-    // the former "Auto temperature" bolt is a DeviceThermostat. Menu and
-    // pause/step icons remain distinct.
+    // No lightning-bolt icons anywhere, per the captain's "no icon may
+    // mean two things" rule. The former "New canvas" bolt is gone (Reset
+    // canvas now lives in the hamburger menu); the former "Auto
+    // temperature" bolt is a DeviceThermostat. Menu and pause/step icons
+    // remain distinct.
     //
     // Captain parity gap H19: Freeze (same affordance as the previous
     // Pause/Resume toggle - paint still writes while physics ticks are

@@ -373,10 +373,10 @@ class SimViewModel : ViewModel() {
     fun brushSignSnapshot(): Double = _brush.value.sign
 
     /**
-     * Touch-driven paint. Firstmate bug #6: a per-point coroutine launch
-     * would race the ACTION_UP callback and drop tail points on a fast
-     * swipe. `paintBegin` / `paintPoint` are cheap (Vec::push through a
-     * small mutex on the Rust side), so we run them synchronously in the
+     * Touch-driven paint. A per-point coroutine launch would race the
+     * ACTION_UP callback and drop tail points on a fast swipe.
+     * `paintBegin` / `paintPoint` are cheap (Vec::push through a small
+     * mutex on the Rust side), so we run them synchronously in the
      * caller's thread; ordering is preserved by call order. `paintEnd`
      * takes the physics-side sim mutex (paint_stroke recomputes the
      * u_edge patch), so it goes to Default to avoid stalling the touch
@@ -541,8 +541,8 @@ class SimViewModel : ViewModel() {
     /**
      * Reset the sim to a fresh blank at the current params. The
      * `nativeSimLoadPreset("blank")` path in `coulomb-jni` rebuilds a
-     * Sim with the current Params via `Sim::new_blank`, which is what
-     * firstmate bug #7 asks for.
+     * Sim with the current Params via `Sim::new_blank`, which gives the
+     * user a fresh charge arrangement without discarding their tuning.
      */
     fun resetCanvas() {
         loadPreset("blank")
@@ -582,9 +582,9 @@ class SimViewModel : ViewModel() {
     /**
      * Update the artist's brush and push every field into the native handle.
      *
-     * Before firstmate bug #10 this only updated the Kotlin state; the native
-     * side kept using `Brush::default()` for every stroke, which the captain
-     * hit on the S24 as "the brush creates fat lines no matter what I try."
+     * Previously this only updated the Kotlin state; the native side kept
+     * using `Brush::default()` for every stroke, which the captain hit on
+     * the S24 as "the brush creates fat lines no matter what I try."
      * Pushing on every change means a slider drag is reflected on the very
      * next `ACTION_DOWN`.
      */
@@ -829,9 +829,9 @@ data class BrushSettings(
 data class ParamsSnapshot(
     val resolution: Int = 512,
     val lineDensity: Double = 1.0,
-    // Firstmate bug #9: periodic boundary on by default so a painted
-    // charge on the far left influences the far right; matches the
-    // Rust-side Params override in nativeSimCreate.
+    // Periodic boundary on by default so a painted charge on the far
+    // left influences the far right; matches the Rust-side Params
+    // override in nativeSimCreate.
     val periodic: Boolean = true,
     // Matches the default `nativeSimCreate` density (40_000 / (512 * 512))
     // so the first Reset reproduces the initial gas; the Rust-side default

@@ -173,7 +173,7 @@ struct Telemetry {
     baseline_energy: f64,
 
     // Total lattice cells the paint brush has touched since the sim was
-    // created. Firstmate's on-device smoke test asserts this is > 0 after a
+    // created. The on-device smoke test asserts this is > 0 after a
     // synthetic swipe, which proves the whole touch -> JNI -> paint_stroke
     // chain is live. Cumulative rather than per-stroke because a spurious
     // extra stroke should still count.
@@ -262,11 +262,10 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimCreate(
             h: h_us,
             w: w_us,
             seed: seed as u64,
-            // Firstmate bug #9: periodic boundary on by default. The
-            // desktop reference uses wrapped boundaries so a charge on
-            // the far left of the canvas exerts its influence on the far
-            // right too. Users who want a hard-wall boundary can toggle
-            // it off in the drawer.
+            // Periodic boundary on by default. The desktop reference uses
+            // wrapped boundaries so a charge on the far left of the canvas
+            // exerts its influence on the far right too. Users who want a
+            // hard-wall boundary can toggle it off in the drawer.
             periodic: true,
             fill,
             ..Params::default()

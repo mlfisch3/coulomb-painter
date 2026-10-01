@@ -23,8 +23,8 @@ No nightly features.
 
 ## How to run
 
-The Python subprocess reads `coulomb.py` and `brush.py` from the fleet-managed reference at `/home/drd/PROJECT/CLAUDE/FM-COULOMB/fm-coulomb/projects/coulomb-brush`.
-Override the path with the `COULOMB_REFERENCE` environment variable when running from another checkout.
+The Python subprocess reads `coulomb.py` and `brush.py` from the Coulomb Brush reference implementation, located via the `COULOMB_REFERENCE` environment variable.
+When unset, the validator falls back to the sibling-directory default `../coulomb-brush` relative to this repo's root.
 
 ```bash
 # from projects/coulomb-painter (the repo root)
