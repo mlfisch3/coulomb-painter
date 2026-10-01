@@ -78,9 +78,9 @@ fun PhysicsSurface(
                     // receives events for the canvas area, Compose sees the
                     // rest.
                     setOnTouchListener { view, event ->
-                        // Firstmate bug #2: when the drawer is open, refuse
-                        // the touch so the dismiss-tap does not also paint.
-                        // The next tap after the drawer closes paints.
+                        // When the drawer is open, refuse the touch so the
+                        // dismiss-tap does not also paint. The next tap
+                        // after the drawer closes paints.
                         if (!touchEnabledRef.v) return@setOnTouchListener false
                         handleTouch(vm, view, event, lattice, gesture)
                     }

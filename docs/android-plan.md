@@ -18,7 +18,7 @@ Windows and iOS come after Android reaches parity with the desktop reference on 
 ## 0. Where things stand
 
 The image the captain sent is the desktop browser prototype from `projects/coulomb-brush/`, running at ~305 M moves/s on his desktop GPU.
-The parameter surface has grown since the 2026-09-09 snapshot into this fleet's clone: **VERIFIED** by `ls -la projects/coulomb-brush/*.py` showing the latest mtimes are 2026-08-08.
+The parameter surface has grown since the 2026-09-09 snapshot of the reference checkout: **VERIFIED** by `ls -la projects/coulomb-brush/*.py` showing the latest mtimes are 2026-08-08.
 Key visible controls (from the screenshot and confirmed against `projects/coulomb-brush/gui/index.html`): source & lattice (image picker, resolution, line charge density, line-blocks-particles, line threshold, saved-state loader); mobile charges (fill, charge per particle); interaction (strength, screening, cutoff, periodic); short-range attraction (well depth, range); annealing (temperature, cooling, auto-T, schedule, reheat amp/period/decay, cooling rate, batch, batch_min, batch_decrement, fail_limit, hop); charge brush (paint mode, sign, magnitude, density, thickness, flow, hardness, penetrability, coupling, budget, heat pulse, relax ceiling, show painted, Accept/Undo/Clear); heat brush (mode, temperature, radius, hardness, wake regions, wake relax); top-bar actions (Pause, Step once, Build/reload, Reset layout, Auto temperature, Save state, Snapshot + params); magnifier lens with span/every/fps/record; V(r) plot; energy/temperature vs iteration plot; live stats readout.
 
 That is what the mobile port has to preserve behaviourally.

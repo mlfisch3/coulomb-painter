@@ -31,13 +31,16 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 COULOMB_BRUSH = (HERE / ".." / ".." / "reference").resolve()
 
-# The reference brush code sits in a fleet-managed sibling worktree,
-# not in this repo. The wrapper script `fetch_reference.py` writes its
-# path here. Fall back to the standard fleet location when unset.
+# The reference brush code lives in a separate repository (the Coulomb
+# Brush reference implementation), not in this repo. Point at it with
+# the `COULOMB_REFERENCE` environment variable; when unset, fall back
+# to a sibling-directory default `../coulomb-brush` relative to this
+# repo's root.
+REPO_ROOT = (HERE / ".." / "..").resolve()
 DEFAULT_REFERENCE = Path(
     os.environ.get(
         "COULOMB_REFERENCE",
-        "/home/drd/PROJECT/CLAUDE/FM-COULOMB/fm-coulomb/projects/coulomb-brush",
+        str(REPO_ROOT / ".." / "coulomb-brush"),
     )
 )
 
