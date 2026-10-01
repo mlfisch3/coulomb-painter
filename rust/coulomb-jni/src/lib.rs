@@ -150,9 +150,22 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimCreate(
         if h <= 0 || w <= 0 || n_particles < 0 {
             return 0;
         }
+        let h_us = h as usize;
+        let w_us = w as usize;
+        let n_us = n_particles as usize;
+        // Anchor params.fill to the fraction the caller actually created with
+        // so a subsequent Reset reproduces this density by default; the user
+        // can edit fill through nativeSimSetParam and the new value flows
+        // through to the next Reset via set_param -> params.fill.
+        let total = (h_us * w_us) as f64;
+        let fill = if total > 0.0 {
+            (n_us as f64 / total).clamp(0.0, 1.0)
+        } else {
+            Params::default().fill
+        };
         let params = Params {
-            h: h as usize,
-            w: w as usize,
+            h: h_us,
+            w: w_us,
             seed: seed as u64,
             // Firstmate bug #9: periodic boundary on by default. The
             // desktop reference uses wrapped boundaries so a charge on
@@ -160,9 +173,10 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimCreate(
             // right too. Users who want a hard-wall boundary can toggle
             // it off in the drawer.
             periodic: true,
+            fill,
             ..Params::default()
         };
-        let sim = Sim::new_blank(params, n_particles as usize);
+        let sim = Sim::new_blank(params, n_us);
         let handle = SimHandle::new(sim);
         Box::into_raw(handle) as jlong
     })
@@ -749,16 +763,25 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadPreset
             Ok(s) => s.into(),
             Err(_) => return JNI_FALSE,
         };
-        // Preserve params AND the current particle count so `Reset canvas`
-        // gives the user a fresh arrangement of the same charge population;
-        // n=0 would leave a blank navy field, which is not the reset the
-        // captain asks for in firstmate bug #7.
+        // Reset derives the particle count from the live fill fraction so a
+        // slider edit (fill up, fill down) is reflected on the very next
+        // reset. The seed ratchets each call so repeated Resets vary the
+        // arrangement - the captain's mental model of Reset is "give me a
+        // fresh gas", not "re-emit the same arrangement a stride placement
+        // produced"; the stride variant stays reserved for coulomb-validate.
         let sim_ref = h.sim.lock().unwrap();
-        let params = sim_ref.params().clone();
-        let n = sim_ref.occupancy().iter().filter(|&&b| b).count();
+        let mut params = sim_ref.params().clone();
+        let prev_n = sim_ref.occupancy().iter().filter(|&&b| b).count();
         drop(sim_ref);
+        let total = params.h * params.w;
+        let n = ((params.fill * total as f64).round() as isize).max(0) as usize;
+        let n = n.min(total);
+        // Mix the previous seed with an increment that is coprime with the
+        // Pcg64Mcg state size, so repeat Resets of the same canvas keep
+        // generating distinct arrangements without pathological short cycles.
+        params.seed = params.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let fresh = match name.as_str() {
-            "blank" => Sim::new_blank(params, n),
+            "blank" => Sim::new_random(params, n),
             // The wire-mesh preset is the shared parity fixture: a geometric
             // image both the desktop Python engine and the Android Rust
             // engine can run at the same seed, so a screenshot pair on
@@ -766,9 +789,12 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadPreset
             // line_width are the same shape `docs/screenshots/m3c-wire-mesh.png`
             // encodes (grid every 16 lattice cells, 1-cell-thick rails on a
             // 256-wide lattice — subject to the current lattice).
+            // Keeps the stride placement here so the parity screenshot stays
+            // comparable across runs; the deterministic Reset the artist
+            // sees is scoped to blank only.
             "wire_mesh" => {
                 let step = (params.w / 16).max(8);
-                Sim::new_wire_mesh(params, n, step, 1)
+                Sim::new_wire_mesh(params, prev_n.max(n), step, 1)
             }
             // Horizontal rails at ~1/10 of the lattice. The gap between rails
             // is thick enough that mobile charge can form a visible stripe,
@@ -913,6 +939,7 @@ fn read_param(sim: &Sim, key: &str) -> f64 {
         "screening" => p.screening,
         "cutoff" => p.cutoff,
         "charge" => p.charge,
+        "fill" => p.fill,
         "attract_depth" => p.attract_depth,
         "attract_range" => p.attract_range,
         "batch" => p.batch as f64,
@@ -934,6 +961,7 @@ fn params_to_json(p: &Params) -> serde_json::Value {
         "cutoff": p.cutoff,
         "periodic": p.periodic,
         "charge": p.charge,
+        "fill": p.fill,
         "attract_depth": p.attract_depth,
         "attract_range": p.attract_range,
         "temperature": p.temperature,

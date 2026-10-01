@@ -117,6 +117,7 @@ fn main() {
         charge: sc.charge,
         attract_depth: sc.attract_depth,
         attract_range: sc.attract_range,
+        fill: 0.30,
         temperature,
         batch: 1,
         batch_min: 1,
