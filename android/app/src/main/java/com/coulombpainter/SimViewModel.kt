@@ -1,14 +1,21 @@
 package com.coulombpainter
 
+import android.content.Context
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -84,6 +91,57 @@ class SimViewModel : ViewModel() {
     private val _running = MutableStateFlow(true)
     val running: StateFlow<Boolean> = _running.asStateFlow()
 
+    private var persistenceJob: Job? = null
+
+    /**
+     * Hydrate the Kotlin-side state from a previously saved snapshot. Must be
+     * called before [ensureCreated] so the first `pushBrushToNative` and
+     * `pushParamsToNative` pick up the restored values; otherwise the native
+     * side starts on the hard-coded defaults and the artist loses their
+     * tuning across a reboot or app update. The `running` flag is applied as
+     * well so a deliberately paused session comes back paused rather than
+     * silently resuming.
+     */
+    fun restoreSettings(brush: BrushSettings, params: ParamsSnapshot, running: Boolean) {
+        _brush.value = brush
+        _params.value = params
+        _running.value = running
+    }
+
+    /**
+     * Observe the state flows and persist each change to [SettingsStore].
+     * Started by MainActivity after [restoreSettings] + [ensureCreated] so the
+     * first on-screen frame already reflects the saved values and any
+     * subsequent slider move writes back. The `drop(1)` suppresses the
+     * initial emission; the `debounce` coalesces mid-drag storms since the
+     * drawer's LiveSlider pattern commits on `onValueChangeFinished` while
+     * BrushRow fires per-tick during a drag.
+     */
+    @OptIn(FlowPreview::class)
+    fun startPersistence(appContext: Context) {
+        if (persistenceJob != null) return
+        val ctx = appContext.applicationContext
+        persistenceJob = viewModelScope.launch(Dispatchers.IO) {
+            _brush
+                .drop(1)
+                .distinctUntilChanged()
+                .debounce(300L)
+                .onEach { SettingsStore.saveBrush(ctx, it) }
+                .launchIn(this)
+            _params
+                .drop(1)
+                .distinctUntilChanged()
+                .debounce(300L)
+                .onEach { SettingsStore.saveParams(ctx, it) }
+                .launchIn(this)
+            _running
+                .drop(1)
+                .distinctUntilChanged()
+                .onEach { SettingsStore.saveRunning(ctx, it) }
+                .launchIn(this)
+        }
+    }
+
     fun ensureCreated(h: Int, w: Int, seed: Long, nParticles: Int) {
         if (handle != 0L) return
         // The native call is cheap on a small lattice but returns 0 on
@@ -101,6 +159,12 @@ class SimViewModel : ViewModel() {
         // brush to the fat-line default or the interaction cutoff to 12.
         pushBrushToNative()
         pushParamsToNative()
+        // If the artist left the previous session paused, the restored
+        // _running is false; mirror it on the native handle so the paused
+        // state is explicit on both sides. The tick loop already guards on
+        // _running.value, but keeping native in sync matches the pause/resume
+        // button contract.
+        if (!_running.value) CoulombNative.nativeSimPause(handle)
         startLoops()
     }
 
@@ -389,6 +453,7 @@ class SimViewModel : ViewModel() {
         val p = _params.value
         pushOne("temperature", p.temperature)
         pushOne("charge", p.charge)
+        pushOne("fill", p.fill)
         pushOne("strength", p.strength)
         pushOne("screening", p.screening)
         pushOne("cutoff", p.cutoff)
@@ -432,6 +497,7 @@ class SimViewModel : ViewModel() {
         tickJob?.cancel()
         statsJob?.cancel()
         thermalJob?.cancel()
+        persistenceJob?.cancel()
         if (handle != 0L) {
             // Unbind the surface first so wgpu can drop its swapchain before
             // the physics core goes away. Destroy is idempotent on an empty
@@ -506,6 +572,10 @@ data class ParamsSnapshot(
     // charge on the far left influences the far right; matches the
     // Rust-side Params override in nativeSimCreate.
     val periodic: Boolean = true,
+    // Matches the default `nativeSimCreate` density (40_000 / (512 * 512))
+    // so the first Reset reproduces the initial gas; the Rust-side default
+    // is 0.30 (Python-matching) but is overridden on create.
+    val fill: Double = 40_000.0 / (512.0 * 512.0),
     val temperature: Double = 5000.0,
     val strength: Double = 1.0,
     val screening: Double = 0.0,
@@ -528,6 +598,7 @@ data class ParamsSnapshot(
         "screening" -> copy(screening = value)
         "cutoff" -> copy(cutoff = value)
         "charge" -> copy(charge = value)
+        "fill" -> copy(fill = value.coerceIn(0.0, 1.0))
         "attract_depth" -> copy(attractDepth = value)
         "attract_range" -> copy(attractRange = value)
         "batch" -> copy(batch = value.toInt().coerceAtLeast(1))

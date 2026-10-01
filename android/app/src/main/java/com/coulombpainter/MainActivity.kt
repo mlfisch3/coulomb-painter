@@ -21,10 +21,25 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        // Captain rule (data/captain.md): parameter settings preserved across
+        // app updates and across reset/new-canvas actions. Restore must land
+        // before ensureCreated so the pushBrushToNative / pushParamsToNative
+        // calls inside ensureCreated carry the saved values straight into the
+        // fresh handle rather than overwriting them with the hard-coded
+        // defaults a cold start would otherwise use.
+        val restored = SettingsStore.loadBlocking(this)
+        simVm.restoreSettings(restored.brush, restored.params, restored.running)
+
         // 512x512 mid-range default per docs/android-plan.md §5. The seed is
         // fixed at 0 so a fresh launch always reproduces the same starting
         // arrangement; M4 exposes it through the New Canvas dialog.
         simVm.ensureCreated(h = 512, w = 512, seed = 0L, nParticles = 40_000)
+
+        // Begin observing state flows so every subsequent brush / params /
+        // running change writes back to DataStore. Started after
+        // ensureCreated so the initial pushes above are not themselves
+        // persisted (drop(1) is also in place for defence in depth).
+        simVm.startPersistence(applicationContext)
 
         // Thermal telemetry: forecast headroom 10 s out. Available on API 30
         // (Android 11) and above; the app supports minSdk 26, so pre-30

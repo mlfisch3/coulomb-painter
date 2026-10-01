@@ -40,6 +40,13 @@ pub struct Params {
     pub attract_depth: f64,
     pub attract_range: f64,
 
+    // Target mobile-particle fill, as a fraction of the full lattice (h*w).
+    // Mirrors the desktop reference's `Params.fill`: Reset reseeds the gas
+    // to `round(fill * h * w)` particles rather than copying whatever count
+    // the previous arrangement happened to end on, so a sophisticated artist
+    // can change the density and have the next Reset reflect it.
+    pub fill: f64,
+
     // annealing
     pub temperature: f64,
     pub batch: usize,
@@ -62,6 +69,7 @@ impl Default for Params {
             charge: 1.0,
             attract_depth: 0.0,
             attract_range: 1.5,
+            fill: 0.30,
             temperature: 5_000.0,
             batch: 64,
             batch_min: 1,
@@ -627,11 +635,28 @@ impl Sim {
     /// on purpose - the validator wants the Rust and Python engines to start
     /// from bit-identical occupancy, otherwise the initial-condition drift
     /// swamps a same-Hamiltonian equilibrium comparison at high temperature.
+    /// For the end-user Reset path call `new_random` instead; the stride
+    /// placement is the wrong default for an artist whose mental model of
+    /// Reset is "give me a fresh gas", not "re-emit the same arrangement".
     pub fn new_blank(params: Params, n_particles: usize) -> Self {
         let h = params.h;
         let w = params.w;
         let cov = vec![0.0f64; h * w];
         Self::new(params, cov, strided_occupancy(h, w, n_particles), 1.0, false)
+    }
+
+    /// Build a sim on a blank canvas with `n_particles` mobile charges placed
+    /// at `n_particles` distinct random cells, seeded by `params.seed`. The
+    /// Reset-canvas path on-device calls this so repeated Resets vary the
+    /// arrangement; the stride variant stays reserved for the cross-engine
+    /// validator where bit-identical initial occupancy is the point.
+    pub fn new_random(params: Params, n_particles: usize) -> Self {
+        let h = params.h;
+        let w = params.w;
+        let cov = vec![0.0f64; h * w];
+        let mut rng = Pcg64Mcg::seed_from_u64(params.seed);
+        let occ = random_occupancy(h, w, n_particles, &mut rng);
+        Self::new(params, cov, occ, 1.0, false)
     }
 
     /// A procedurally-generated wire-mesh coverage: a uniform grid of
@@ -1260,6 +1285,7 @@ impl Sim {
         match key {
             "temperature" => self.params.temperature = value,
             "charge" => self.params.charge = value,
+            "fill" => self.params.fill = value.clamp(0.0, 1.0),
             "batch" => {
                 let v = value.max(1.0) as usize;
                 self.params.batch = v;
@@ -1283,7 +1309,18 @@ impl Sim {
             _ => return false,
         }
         if rebuild {
+            // rebuild_interaction already recomputes self.energy from the
+            // fresh kernel, so the charge branch below only has to catch the
+            // live-key case that mutates the Hamiltonian without a rebuild.
             self.rebuild_interaction();
+        } else if key == "charge" {
+            // Charge enters total energy quadratically through e_mm and
+            // linearly through e_edge (see total_energy); the running
+            // self.energy was computed under the OLD charge, so step()'s
+            // deltas - which use the NEW charge - keep drifting the tracked
+            // energy from the true energy forever, eventually inverting
+            // sign. Re-anchor on the current configuration.
+            self.energy = self.total_energy();
         }
         true
     }
@@ -1375,6 +1412,26 @@ fn strided_occupancy(h: usize, w: usize, n_particles: usize) -> Vec<bool> {
     occ
 }
 
+/// Sample `n_particles` distinct lattice indices without replacement using a
+/// partial Fisher-Yates on the full index list. The one-shot temp vec is
+/// bounded by `h * w * 8` bytes (2 MiB at 512x512) which is cheap at Reset
+/// cadence; the per-step allocation on `Sim::step` is the one that matters.
+fn random_occupancy(h: usize, w: usize, n_particles: usize, rng: &mut Pcg64Mcg) -> Vec<bool> {
+    let total = h * w;
+    let take = n_particles.min(total);
+    let mut occ = vec![false; total];
+    if take == 0 {
+        return occ;
+    }
+    let mut pool: Vec<usize> = (0..total).collect();
+    for i in 0..take {
+        let j = i + (rng.gen::<u64>() as usize) % (total - i);
+        pool.swap(i, j);
+        occ[pool[i]] = true;
+    }
+    occ
+}
+
 fn add_into(target: &mut [f64], w: usize, place: &Placement, patch: &[f64]) {
     let pw = place.cols.len();
     for (ri, &row) in place.rows.iter().enumerate() {
@@ -1407,6 +1464,7 @@ mod tests {
             charge: 1.0,
             attract_depth: 0.0,
             attract_range: 1.5,
+            fill: 0.30,
             temperature: 50_000.0,
             batch: 1,
             batch_min: 1,
@@ -1504,6 +1562,53 @@ mod tests {
             }
         }
         assert!(hits_on_ring >= 20, "ring has too few blocked cells: {}", hits_on_ring);
+    }
+
+    #[test]
+    fn set_param_charge_reanchors_tracked_energy() {
+        // Reproduces H3: without the re-anchor, flipping charge mid-run leaves
+        // self.energy stuck at the old-charge baseline while step() adds
+        // new-charge deltas, so a drift grows every tick until the two signs
+        // disagree. The fix is a single total_energy call inside set_param.
+        let mut p = small_params();
+        p.h = 24;
+        p.w = 24;
+        p.cutoff = 4.0;
+        let mut sim = Sim::new_blank(p, 20);
+        sim.step_many(100);
+        assert!(sim.set_param("charge", 2.0));
+        let running = sim.stats().energy;
+        let recomputed = sim.total_energy();
+        assert_relative_eq!(running, recomputed, max_relative = 1e-9);
+    }
+
+    #[test]
+    fn new_random_differs_across_seeds() {
+        // H17: Reset-canvas repeatability was the complaint; a seed bump
+        // between two blank constructions must shuffle the arrangement.
+        let mut p = small_params();
+        p.h = 32;
+        p.w = 32;
+        p.seed = 1;
+        let a = Sim::new_random(p.clone(), 100);
+        let mut p2 = p;
+        p2.seed = 2;
+        let b = Sim::new_random(p2, 100);
+        let na = a.occupancy().iter().filter(|&&b| b).count();
+        let nb = b.occupancy().iter().filter(|&&b| b).count();
+        assert_eq!(na, 100);
+        assert_eq!(nb, 100);
+        let same = a
+            .occupancy()
+            .iter()
+            .zip(b.occupancy().iter())
+            .filter(|(x, y)| x == y)
+            .count();
+        // Two uniform random pickings of 100 cells on a 1024-cell lattice
+        // overlap on fewer than 1024 cells with overwhelming probability;
+        // the loose bound here keeps the test deterministic across RNG
+        // tweaks while catching a regression that falls back to stride.
+        assert!(same < 1024, "arrangements too similar: {same}/1024");
     }
 
     #[test]

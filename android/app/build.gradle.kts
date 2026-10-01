@@ -73,6 +73,11 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+    // DataStore (preferences flavour) backs persistence of BrushSettings,
+    // ParamsSnapshot, and the running flag so a kill/restart or app update
+    // survives the user's current tuning. Captain rule: parameter settings
+    // preserved across app updates and across reset/new-canvas actions.
+    implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
