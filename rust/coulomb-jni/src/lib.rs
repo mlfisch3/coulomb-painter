@@ -736,6 +736,17 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadPreset
                 let step = (params.w / 16).max(8);
                 Sim::new_wire_mesh(params, n, step, 1)
             }
+            // Horizontal rails at ~1/10 of the lattice. The gap between rails
+            // is thick enough that mobile charge can form a visible stripe,
+            // but close enough that the drawer preset reads as "stripes" at a
+            // glance rather than "a few far-apart lines".
+            "stripes" => {
+                let step = (params.h / 10).max(8);
+                Sim::new_stripes(params, n, step, 2)
+            }
+            // Hollow ring at 0.42 of the shorter lattice side, matching the
+            // desktop `disc_outline` fixture used in the parity campaigns.
+            "disc" => Sim::new_disc(params, n, 0.42, 2),
             _ => return JNI_FALSE,
         };
         let energy = fresh.stats().energy;

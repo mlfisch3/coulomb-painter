@@ -686,6 +686,79 @@ impl Sim {
         )
     }
 
+    /// Horizontal rails only: the "stripes" test pattern the drawer footer
+    /// advertises alongside the wire mesh. Same `step` / `line_width` shape as
+    /// `new_wire_mesh` minus the vertical rails, so the gas is driven into
+    /// stripes between the rails rather than into the squarish cells of a
+    /// grid.
+    pub fn new_stripes(
+        params: Params,
+        n_particles: usize,
+        step: usize,
+        line_width: usize,
+    ) -> Self {
+        let h = params.h;
+        let w = params.w;
+        let mut cov = vec![0.0f64; h * w];
+        let step = step.max(2);
+        let hw = line_width.max(1) / 2;
+        let mut y = step;
+        while y < h {
+            let y0 = y.saturating_sub(hw);
+            let y1 = (y + hw + 1).min(h);
+            for ry in y0..y1 {
+                for x in 0..w {
+                    cov[ry * w + x] = 1.0;
+                }
+            }
+            y += step;
+        }
+        Self::new(
+            params,
+            cov,
+            strided_occupancy(h, w, n_particles),
+            1.0,
+            true,
+        )
+    }
+
+    /// A single hollow-circle rail: the "disc" test pattern. Charge is
+    /// confined by the ring and relaxes onto the inner / outer surface the way
+    /// the desktop `disc_outline` fixture drives it. `radius_frac` is the
+    /// outline radius as a fraction of the shorter lattice side; `line_width`
+    /// is the ring thickness in cells (minimum 1).
+    pub fn new_disc(
+        params: Params,
+        n_particles: usize,
+        radius_frac: f64,
+        line_width: usize,
+    ) -> Self {
+        let h = params.h;
+        let w = params.w;
+        let mut cov = vec![0.0f64; h * w];
+        let cy = h as f64 / 2.0;
+        let cx = w as f64 / 2.0;
+        let r = (h.min(w) as f64) * radius_frac;
+        let half = (line_width.max(1) as f64) / 2.0;
+        for y in 0..h {
+            for x in 0..w {
+                let dy = y as f64 + 0.5 - cy;
+                let dx = x as f64 + 0.5 - cx;
+                let d = (dx * dx + dy * dy).sqrt();
+                if (d - r).abs() <= half {
+                    cov[y * w + x] = 1.0;
+                }
+            }
+        }
+        Self::new(
+            params,
+            cov,
+            strided_occupancy(h, w, n_particles),
+            1.0,
+            true,
+        )
+    }
+
     // -- energy -------------------------------------------------------
 
     pub fn total_energy(&self) -> f64 {
@@ -1388,6 +1461,49 @@ mod tests {
             direct += potential(r, &p, false);
         }
         assert_relative_eq!(u[py as usize * p.w + px as usize], direct, max_relative = 1e-8);
+    }
+
+    #[test]
+    fn stripes_preset_has_horizontal_rails_only() {
+        let p = small_params();
+        let sim = Sim::new_stripes(p, 40, 8, 1);
+        // At step=8, line_width=1 on a 32x32 lattice: rails at y=8, 16, 24,
+        // one cell thick each. Those sites must read as blocked; the rows
+        // between them must stay unblocked so the gas can relax between
+        // stripes rather than hitting a grid cell.
+        let blocked = sim.blocked();
+        for x in 0..32 {
+            assert!(blocked[8 * 32 + x], "stripe at y=8 x={} not blocked", x);
+            assert!(blocked[16 * 32 + x], "stripe at y=16 x={} not blocked", x);
+            assert!(blocked[24 * 32 + x], "stripe at y=24 x={} not blocked", x);
+            assert!(!blocked[12 * 32 + x], "gap at y=12 x={} unexpectedly blocked", x);
+        }
+    }
+
+    #[test]
+    fn disc_preset_rail_is_a_closed_ring() {
+        let p = small_params();
+        // radius_frac 0.4 of 32 is 12.8; so the ring sits near r=12.8 cells.
+        let sim = Sim::new_disc(p, 30, 0.4, 1);
+        let blocked = sim.blocked();
+        let cy = 16.0f64;
+        let cx = 16.0f64;
+        // The center must be clear and the far corners must be clear;
+        // somewhere near r=12.8 at each cardinal direction must be blocked.
+        assert!(!blocked[16 * 32 + 16], "disc center should be inside the ring");
+        assert!(!blocked[0], "disc preset should not block the lattice corners");
+        let mut hits_on_ring = 0usize;
+        for y in 0..32 {
+            for x in 0..32 {
+                let dy = y as f64 + 0.5 - cy;
+                let dx = x as f64 + 0.5 - cx;
+                let d = (dx * dx + dy * dy).sqrt();
+                if (d - 12.8).abs() <= 0.5 && blocked[y * 32 + x] {
+                    hits_on_ring += 1;
+                }
+            }
+        }
+        assert!(hits_on_ring >= 20, "ring has too few blocked cells: {}", hits_on_ring);
     }
 
     #[test]

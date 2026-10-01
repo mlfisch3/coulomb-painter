@@ -102,6 +102,14 @@ fun CoulombPainterApp(vm: SimViewModel) {
                     vm.loadPreset("wire_mesh")
                     coroutineScope.launch { drawerState.close() }
                 },
+                onLoadStripes = {
+                    vm.loadPreset("stripes")
+                    coroutineScope.launch { drawerState.close() }
+                },
+                onLoadDisc = {
+                    vm.loadPreset("disc")
+                    coroutineScope.launch { drawerState.close() }
+                },
                 // Close-X in the drawer header: without gestures the artist
                 // previously had no way off this panel. The X sits at the
                 // top-right per captain report and closes the drawer via the

@@ -18,7 +18,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.GridOn
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Reorder
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Slider
@@ -68,6 +70,8 @@ fun ParametersDrawer(
     onNewCanvas: () -> Unit = {},
     onResetCanvas: () -> Unit = {},
     onLoadWireMesh: () -> Unit = {},
+    onLoadStripes: () -> Unit = {},
+    onLoadDisc: () -> Unit = {},
     onClose: () -> Unit = {},
 ) {
     ModalDrawerSheet(
@@ -141,6 +145,24 @@ fun ParametersDrawer(
                 label = "Load wire mesh test pattern",
                 onClick = onLoadWireMesh,
             )
+            // Horizontal rails only. `Reorder` (three stacked horizontal
+            // lines) reads as "stripes" at a glance and is distinct from
+            // every other icon in the app per the captain's "no icon may
+            // mean two things" rule.
+            MenuRow(
+                icon = Icons.Filled.Reorder,
+                iconDescription = "Load stripes test pattern",
+                label = "Load stripes test pattern",
+                onClick = onLoadStripes,
+            )
+            // A single hollow ring: `RadioButtonUnchecked` is literally that
+            // shape, and no other row uses it.
+            MenuRow(
+                icon = Icons.Filled.RadioButtonUnchecked,
+                iconDescription = "Load disc test pattern",
+                label = "Load disc test pattern",
+                onClick = onLoadDisc,
+            )
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -148,13 +170,16 @@ fun ParametersDrawer(
                     .background(CpLine),
             )
             AccordionGroup(title = "Source & Lattice", initiallyOpen = true) {
-                ParamRow("image", "wire_mesh", onHelp = { onHelp("source.image") })
+                ParamRow("image", "wire_mesh",
+                    onHelp = { onHelp("source.image") }, comingSoon = true)
                 ParamRow("resolution", params.resolution.toString(),
-                    onHelp = { onHelp("source.resolution") })
+                    onHelp = { onHelp("source.resolution") }, comingSoon = true)
                 ParamRow("line charge density", "%.2f".format(params.lineDensity),
-                    onHelp = { onHelp("source.line_density") })
-                ParamRow("line blocks particles", "on", onHelp = { onHelp("source.line_blocks") })
-                ParamRow("line threshold", "0.50", onHelp = { onHelp("source.threshold") })
+                    onHelp = { onHelp("source.line_density") }, comingSoon = true)
+                ParamRow("line blocks particles", "on",
+                    onHelp = { onHelp("source.line_blocks") }, comingSoon = true)
+                ParamRow("line threshold", "0.50",
+                    onHelp = { onHelp("source.threshold") }, comingSoon = true)
                 ParamRow(
                     key = "periodic boundary",
                     value = if (params.periodic) "on" else "off",
@@ -163,7 +188,8 @@ fun ParametersDrawer(
                 )
             }
             AccordionGroup(title = "Mobile charges", initiallyOpen = false) {
-                ParamRow("initial fill", "0.35", onHelp = { onHelp("mobile.fill") })
+                ParamRow("initial fill", "0.35",
+                    onHelp = { onHelp("mobile.fill") }, comingSoon = true)
                 LiveSlider(
                     label = "charge per particle",
                     value = params.charge,
@@ -229,15 +255,15 @@ fun ParametersDrawer(
                         onParamChange(k, v)
                     },
                 )
-                // Cooling active + schedule + rate are decorative for now
-                // (the core has no cooling schedule of its own - temperature
-                // moves only when the artist sets it or auto-T probes).
+                // Cooling schedule is owned by the painter-core-feature-port
+                // follow-up (the core has no cooling schedule yet). Tagged
+                // coming-soon so the user does not expect the rows to react.
                 ParamRow("cooling active", if (params.coolingActive) "on" else "off",
-                    onHelp = { onHelp("anneal.cooling_active") })
+                    onHelp = { onHelp("anneal.cooling_active") }, comingSoon = true)
                 ParamRow("schedule", params.schedule,
-                    onHelp = { onHelp("anneal.schedule") })
+                    onHelp = { onHelp("anneal.schedule") }, comingSoon = true)
                 ParamRow("cooling rate / 1000", "%.2f".format(params.coolingRate),
-                    onHelp = { onHelp("anneal.rate") })
+                    onHelp = { onHelp("anneal.rate") }, comingSoon = true)
                 LiveSlider(
                     label = "batch",
                     value = params.batch.toDouble(),
@@ -280,8 +306,10 @@ fun ParametersDrawer(
                     onHelp = { onHelp("compute.step_size") },
                     onCommit = onParamChange,
                 )
-                ParamRow("gpu backend", "wgpu (Vulkan)",
-                    onHelp = { onHelp("compute.backend") })
+                // Compute still runs on the CPU; the GPU backend selector is
+                // owned by the painter-gpu-compute-wiring follow-up.
+                ParamRow("gpu backend", "CPU",
+                    onHelp = { onHelp("compute.backend") }, comingSoon = true)
                 ParamRow(
                     key = "show diagnostics",
                     value = if (showDiagnostics) "on" else "off",
@@ -290,20 +318,15 @@ fun ParametersDrawer(
                 )
             }
             AccordionGroup(title = "Display", initiallyOpen = false) {
-                // Firstmate bug #3: painted charges are visible by default
-                // so the user sees the lines they drew, not just their
-                // repulsive effect. Renderer draws painted cells in
-                // teal-cyan on top of the mobile amber layer.
-                ParamRow("show painted charge", "on", onHelp = { onHelp("display.painted") })
-                ParamRow("lens", "off", onHelp = { onHelp("display.lens") })
+                // Painted-charge overlay is drawn unconditionally today; a
+                // real toggle needs a renderer param plumbed through, which
+                // is not in this cleanup's scope.
+                ParamRow("show painted charge", "on",
+                    onHelp = { onHelp("display.painted") }, comingSoon = true)
+                ParamRow("lens", "off",
+                    onHelp = { onHelp("display.lens") }, comingSoon = true)
             }
             Spacer(Modifier.height(24.dp))
-            Text(
-                "Preset library (blank, wire mesh, stripes, disc) opens from the top menu.",
-                color = CpDimmer,
-                fontSize = 11.sp,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-            )
         }
     }
 }
@@ -407,13 +430,23 @@ private fun LiveSlider(
     }
 }
 
+/**
+ * Static display row. Pass `comingSoon = true` for a row that shows a value
+ * but has no live control yet: the audit called this cluster of rows out as
+ * "look live but do nothing", and the fix is a visible tag that stops the
+ * user from tapping expecting an action. Interactive rows (periodic boundary,
+ * show diagnostics) stay full-contrast and never carry the tag.
+ */
 @Composable
 private fun ParamRow(
     key: String,
     value: String,
     onHelp: () -> Unit,
     onClickValue: (() -> Unit)? = null,
+    comingSoon: Boolean = false,
 ) {
+    val keyColor = if (comingSoon) CpDimmer else CpDim
+    val valueColor = if (comingSoon) CpDim else CpInk
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -421,15 +454,27 @@ private fun ParamRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Text(
-            key,
-            color = CpDim,
-            fontSize = 12.sp,
+        Row(
             modifier = Modifier.weight(1f),
-        )
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                key,
+                color = keyColor,
+                fontSize = 12.sp,
+            )
+            if (comingSoon) {
+                Text(
+                    "(coming soon)",
+                    color = CpDimmer,
+                    fontSize = 10.sp,
+                )
+            }
+        }
         Text(
             value,
-            color = CpInk,
+            color = valueColor,
             fontSize = 12.sp,
             fontFamily = FontFamily.Monospace,
             modifier = if (onClickValue != null) Modifier.clickable(onClick = onClickValue) else Modifier,
