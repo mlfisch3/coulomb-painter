@@ -35,6 +35,10 @@ wgpu = { version = "0.19", default-features = false, features = ["wgsl"] }
 bytemuck = { version = "1", features = ["derive"] }
 raw-window-handle = "0.6"
 pollster = "0.3"
+# `log` is the facade; on android we route it into logcat, on host it is a
+# no-op unless a test harness wires its own logger. Kept in the shared deps
+# so the `log::info!` calls compile on both targets without a cfg wrapper.
+log = "0.4"
 # png encoder for `nativeSimSnapshotPng`. CPU-side render of the current sim
 # state (background + line charge + occupancy + painted charge) into a PNG the
 # Kotlin side can hand to a SAF `CreateDocument` writer. Avoiding the wgpu
@@ -51,6 +55,11 @@ png = "0.17"
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", features = ["all"] }
 ndk-sys = "0.6"
+# Route Rust-side `log::` macros into Android logcat under tag `CoulombJni`.
+# Initialised once at `JNI_OnLoad` so a panic caught by `guard()` leaves a
+# trace instead of a silent `null_mut` return - which is what made the m3d
+# stats-surface regression (R1) expensive to triage from screenshots alone.
+android_logger = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 # `invocation` links the JVM at test time so create/tick/stats round-trips run

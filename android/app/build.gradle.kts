@@ -10,6 +10,11 @@ plugins {
 android {
     namespace = "com.coulombpainter"
     compileSdk = 35
+    // Pin AGP's expected NDK to the version `local.properties` points at and
+    // the GitHub `nttld/setup-ndk@r27c` action provisions, so AGP stops
+    // firing the twelve-times-per-build `[CXX1104]` mismatch warning on the
+    // workstation while the Rust cross-compile stays on NDK 27.
+    ndkVersion = "27.3.13750724"
 
     defaultConfig {
         applicationId = "com.coulombpainter"

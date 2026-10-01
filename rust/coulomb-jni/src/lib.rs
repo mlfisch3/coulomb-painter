@@ -29,8 +29,33 @@ use coulomb_gpu::GpuSim;
 use jni::objects::{JByteArray, JClass, JDoubleArray, JObject, JString};
 use jni::sys::{jboolean, jdouble, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
+use log::{info, warn};
 
 use crate::renderer::Renderer;
+
+// JNI_OnLoad: ART calls this once per process on `System.loadLibrary`. Install
+// the Android logger here, idempotent across repeated activity recreates
+// because `init_once` collapses the second init into a no-op. Everything on
+// the Rust side writes through `log::` from here on, so a panic caught by
+// `guard()` (or a null_mut return from a `nativeSim*` entry point) leaves a
+// trace under `logcat -s CoulombJni` instead of a silent swallow - which is
+// what made the m3d stats-surface regression (R1) expensive to triage.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn JNI_OnLoad(
+    _vm: *mut jni::sys::JavaVM,
+    _reserved: *mut std::ffi::c_void,
+) -> jni::sys::jint {
+    use android_logger::Config;
+    use log::LevelFilter;
+    android_logger::init_once(
+        Config::default()
+            .with_tag("CoulombJni")
+            .with_max_level(LevelFilter::Info),
+    );
+    info!("coulomb-jni loaded: tag=CoulombJni");
+    jni::sys::JNI_VERSION_1_6
+}
 
 // ---------------------------------------------------------------- backend
 
@@ -217,6 +242,24 @@ unsafe fn handle_from<'a>(ptr: jlong) -> Option<&'a SimHandle> {
     Some(unsafe { &*(ptr as *const SimHandle) })
 }
 
+// Poison-tolerant lock. Once any thread panics while holding one of our
+// `Mutex`es (the sim, telem, backend, renderer, …), stdlib marks the mutex
+// poisoned and every subsequent `.lock().unwrap()` panics in turn - which
+// `guard()` catches and returns the safe-zero default for forever. The
+// m3d R1 regression (stats bar stuck on dashes for the whole session) is
+// the user-visible shape of that cascade. Recovering the inner guard here
+// keeps the mutex usable in degraded state; a `warn!` elsewhere surfaces
+// what panicked first so the fix can land in the real culprit.
+fn lock_pt<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(p) => {
+            warn!("poisoned mutex recovered");
+            p.into_inner()
+        }
+    }
+}
+
 // A single guard used at every entry point: JNI FFI is `extern "C"`, which
 // aborts on unwind, so any panic inside the Rust core has to be caught here.
 // The default arms return a "safe zero" value the Kotlin side treats as the
@@ -224,7 +267,20 @@ unsafe fn handle_from<'a>(ptr: jlong) -> Option<&'a SimHandle> {
 fn guard<T>(default: T, f: impl FnOnce() -> T) -> T {
     match panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(v) => v,
-        Err(_) => default,
+        Err(e) => {
+            // `catch_unwind` boxes the panic payload; both static-string and
+            // `format!`-produced panics land here, so cover both before giving
+            // up and reporting "<non-string panic>".
+            let msg = if let Some(s) = e.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic>".to_string()
+            };
+            warn!("guard caught panic: {msg}");
+            default
+        }
     }
 }
 
@@ -305,7 +361,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimPause(
     guard((), || {
         // SAFETY: caller-owned handle; see handle_from doc comment.
         if let Some(h) = unsafe { handle_from(ptr) } {
-            *h.paused.lock().unwrap() = true;
+            *lock_pt(&h.paused) = true;
         }
     })
 }
@@ -319,7 +375,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimResume(
     guard((), || {
         // SAFETY: caller-owned handle; see handle_from doc comment.
         if let Some(h) = unsafe { handle_from(ptr) } {
-            *h.paused.lock().unwrap() = false;
+            *lock_pt(&h.paused) = false;
         }
     })
 }
@@ -350,14 +406,14 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimTick(
         let Some(h) = (unsafe { handle_from(ptr) }) else {
             return 0;
         };
-        if *h.paused.lock().unwrap() {
+        if *lock_pt(&h.paused) {
             return 0;
         }
         let iters = iterations.max(0) as u64;
         if iters == 0 {
             return 0;
         }
-        let mut backend_state = h.backend.lock().unwrap();
+        let mut backend_state = lock_pt(&h.backend);
         if backend_state.active == Backend::Gpu {
             tick_gpu(h, &mut backend_state, iters)
         } else {
@@ -370,16 +426,16 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimTick(
 fn tick_cpu(h: &SimHandle, iters: u64) -> jlong {
     let started = Instant::now();
     let iter_before = {
-        let mut sim = h.sim.lock().unwrap();
+        let mut sim = lock_pt(&h.sim);
         let before = sim.stats().iteration;
         sim.step_many(iters);
         before
     };
-    let iter_after = h.sim.lock().unwrap().stats().iteration;
+    let iter_after = lock_pt(&h.sim).stats().iteration;
     let dt = started.elapsed().as_secs_f64();
     let done = iter_after - iter_before;
 
-    let mut telem = h.telem.lock().unwrap();
+    let mut telem = lock_pt(&h.telem);
     telem.last_tick_wall = Some(started);
     telem.last_tick_iterations = done;
     if dt > 0.0 {
@@ -387,7 +443,7 @@ fn tick_cpu(h: &SimHandle, iters: u64) -> jlong {
         // reported number is proposals-per-second, i.e. iters * batch.
         // The current live_batch is not exposed on Sim, so we approximate
         // with the params batch; the desktop reference does the same.
-        let batch = h.sim.lock().unwrap().params().batch as f64;
+        let batch = lock_pt(&h.sim).params().batch as f64;
         telem.last_mps = (done as f64) * batch / dt;
     }
     done as jlong
@@ -401,7 +457,7 @@ fn tick_gpu(h: &SimHandle, backend_state: &mut BackendState, iters: u64) -> jlon
         // porting the FFT edge rebuild to the GPU (see coulomb-gpu/README.md
         // "u_edge upload contract").
         let (params, occ, blocked, u_edge_f32) = {
-            let sim = h.sim.lock().unwrap();
+            let sim = lock_pt(&h.sim);
             let params = sim.params().clone();
             let occ = sim.occupancy().to_vec();
             let blocked = sim.blocked().to_vec();
@@ -432,7 +488,7 @@ fn tick_gpu(h: &SimHandle, backend_state: &mut BackendState, iters: u64) -> jlon
 
     let started = Instant::now();
     let target_attempts = iters
-        .saturating_mul(h.sim.lock().unwrap().params().batch as u64)
+        .saturating_mul(lock_pt(&h.sim).params().batch as u64)
         .max(1);
 
     let gpu = backend_state.gpu.as_mut().expect("gpu built above");
@@ -441,7 +497,7 @@ fn tick_gpu(h: &SimHandle, backend_state: &mut BackendState, iters: u64) -> jlon
     // rebuild. Other live params that only touch the pair potential
     // (strength / cutoff / screening / attract_*) force a rebuild via
     // `dirty`, so they're handled above.
-    gpu.set_temperature(h.sim.lock().unwrap().params().temperature);
+    gpu.set_temperature(lock_pt(&h.sim).params().temperature);
     let attempted = gpu.step(target_attempts);
     let gpu_stats = gpu.stats();
     let gpu_occ = gpu.occupancy();
@@ -454,7 +510,7 @@ fn tick_gpu(h: &SimHandle, backend_state: &mut BackendState, iters: u64) -> jlon
     backend_state.gpu_particles = gpu_stats.particles;
     backend_state.gpu_occ = Some(gpu_occ);
 
-    let mut telem = h.telem.lock().unwrap();
+    let mut telem = lock_pt(&h.telem);
     telem.last_tick_wall = Some(started);
     telem.last_tick_iterations = attempted;
     if dt > 0.0 {
@@ -488,7 +544,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetBackend
             return Backend::Cpu.as_i32();
         };
         let want = Backend::from_i32(backend_id as i32);
-        let mut backend_state = h.backend.lock().unwrap();
+        let mut backend_state = lock_pt(&h.backend);
         if backend_state.selected == want && backend_state.active == want {
             return backend_state.active.as_i32();
         }
@@ -500,7 +556,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetBackend
                 // not snap back to the pre-GPU snapshot. `replace_occupancy`
                 // scrubs blocked overlaps and rebuilds `pos` + `energy`.
                 if let Some(gpu_occ) = backend_state.gpu_occ.take() {
-                    let mut sim = h.sim.lock().unwrap();
+                    let mut sim = lock_pt(&h.sim);
                     if gpu_occ.len() == sim.params().h * sim.params().w {
                         sim.replace_occupancy(gpu_occ);
                     }
@@ -520,7 +576,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetBackend
                 backend_state.selected = Backend::Gpu;
                 backend_state.dirty = true;
                 let (params, occ, blocked, u_edge_f32) = {
-                    let sim = h.sim.lock().unwrap();
+                    let sim = lock_pt(&h.sim);
                     (
                         sim.params().clone(),
                         sim.occupancy().to_vec(),
@@ -562,7 +618,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimGetBackend
         let Some(h) = (unsafe { handle_from(ptr) }) else {
             return Backend::Cpu.as_i32();
         };
-        h.backend.lock().unwrap().active.as_i32()
+        lock_pt(&h.backend).active.as_i32()
     })
 }
 
@@ -635,7 +691,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimBindSurfac
         let result = unsafe { Renderer::new(&env, raw_obj) };
         match result {
             Ok(r) => {
-                *h.renderer.lock().unwrap() = Some(r);
+                *lock_pt(&h.renderer) = Some(r);
                 JNI_TRUE
             }
             Err(_) => JNI_FALSE,
@@ -657,7 +713,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimUnbindSurf
         let Some(h) = (unsafe { handle_from(ptr) }) else {
             return;
         };
-        *h.renderer.lock().unwrap() = None;
+        *lock_pt(&h.renderer) = None;
     })
 }
 
@@ -679,7 +735,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSurfaceRes
         let Some(h_sim) = (unsafe { handle_from(ptr) }) else {
             return;
         };
-        if let Some(r) = h_sim.renderer.lock().unwrap().as_mut() {
+        if let Some(r) = lock_pt(&h_sim.renderer).as_mut() {
             r.resize(w.max(0) as u32, h.max(0) as u32);
         }
     })
@@ -700,11 +756,11 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRenderFram
         let Some(h) = (unsafe { handle_from(ptr) }) else {
             return;
         };
-        let mut renderer_slot = h.renderer.lock().unwrap();
+        let mut renderer_slot = lock_pt(&h.renderer);
         let Some(renderer) = renderer_slot.as_mut() else {
             return;
         };
-        let sim = h.sim.lock().unwrap();
+        let sim = lock_pt(&h.sim);
         let (w, h_sz) = (sim.params().w as u32, sim.params().h as u32);
         let u_edge = sim.u_edge().to_vec();
         let cpu_occ = sim.occupancy().to_vec();
@@ -714,13 +770,13 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRenderFram
         // mobile particles arrangement up to date between backend-switch
         // syncs; `u_edge` stays fixed during GPU sweeps so the CPU-side
         // paint field is still authoritative for the painted-cell bit.
-        let occ_from_gpu = h.backend.lock().unwrap().gpu_occ.clone();
+        let occ_from_gpu = lock_pt(&h.backend).gpu_occ.clone();
         let occ: Vec<bool> = occ_from_gpu.unwrap_or(cpu_occ);
         // Pack occ + painted into one u32 per cell (bit 0 = mobile, bit 1
         // = painted fixed charge). `u_edge != 0` is what the desktop
         // reference uses to distinguish painted cells (see the desktop
         // brush.py's `sim.painted` accumulator, which feeds u_edge).
-        let mut scratch = h.occ_scratch.lock().unwrap();
+        let mut scratch = lock_pt(&h.occ_scratch);
         if scratch.len() != occ.len() {
             scratch.clear();
             scratch.reserve(occ.len());
@@ -766,7 +822,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetViewpor
         } else {
             None
         };
-        if let Some(r) = h_sim.renderer.lock().unwrap().as_mut() {
+        if let Some(r) = lock_pt(&h_sim.renderer).as_mut() {
             r.set_src_rect(rect);
         }
     })
@@ -787,7 +843,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimAdapterInf
     guard(std::ptr::null_mut(), || {
         // SAFETY: caller-owned handle; see handle_from doc comment.
         let json = match unsafe { handle_from(ptr) } {
-            Some(h) => match h.renderer.lock().unwrap().as_ref() {
+            Some(h) => match lock_pt(&h.renderer).as_ref() {
                 Some(r) => {
                     let info = r.info();
                     serde_json::json!({
@@ -828,9 +884,9 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimPaintBegin
         // `nativeSimSetBrush`, so thickness / hardness / coupling / etc.
         // reach `paint_stroke` instead of the fat-line `Brush::default()`
         // that ignored every knob the artist set.
-        let mut brush = h.brush.lock().unwrap().clone();
+        let mut brush = lock_pt(&h.brush).clone();
         brush.sign = if sign >= 0.0 { 1.0 } else { -1.0 };
-        *h.stroke.lock().unwrap() = Some(InFlightStroke { brush, points: Vec::new() });
+        *lock_pt(&h.stroke) = Some(InFlightStroke { brush, points: Vec::new() });
     })
 }
 
@@ -871,7 +927,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetBrush(
         b.penetrability = penetrability.clamp(0.0, 1.0);
         b.coupling = coupling.max(1.0);
         b.target = if target == 1 { BrushTarget::Mobile } else { BrushTarget::Fixed };
-        *h.brush.lock().unwrap() = b;
+        *lock_pt(&h.brush) = b;
     })
 }
 
@@ -889,7 +945,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimPaintStrok
         let Some(h) = (unsafe { handle_from(ptr) }) else {
             return;
         };
-        let mut slot = h.stroke.lock().unwrap();
+        let mut slot = lock_pt(&h.stroke);
         if let Some(s) = slot.as_mut() {
             // Point order matches coulomb-core: [y, x] in lattice cells.
             s.points.push([y, x]);
@@ -908,7 +964,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimPaintEnd(
         let Some(h) = (unsafe { handle_from(ptr) }) else {
             return;
         };
-        let stroke = h.stroke.lock().unwrap().take();
+        let stroke = lock_pt(&h.stroke).take();
         let Some(s) = stroke else { return };
         if s.points.is_empty() {
             return;
@@ -918,19 +974,19 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimPaintEnd(
         // stroke's `paint_stroke` neighbourhood check sees the arrangement
         // the artist actually drew over, not the pre-GPU snapshot.
         sync_gpu_occ_back(h);
-        let mut sim = h.sim.lock().unwrap();
+        let mut sim = lock_pt(&h.sim);
         let report = sim.paint_stroke(&s.points, &s.brush, true);
         drop(sim);
         // Paint strokes mutate `u_edge` and `blocked`; the GPU engine was
         // initialised with the old buffers, so its sweep would use stale
         // weights. Mark dirty so the next GPU tick re-uploads from the CPU
         // snapshot.
-        h.backend.lock().unwrap().dirty = true;
+        lock_pt(&h.backend).dirty = true;
         // Any new stroke resets the "energy drop" baseline so the UI shows
         // the settling that follows the paint, not one accumulated since sim
         // creation.
-        let energy = h.sim.lock().unwrap().stats().energy;
-        let mut telem = h.telem.lock().unwrap();
+        let energy = lock_pt(&h.sim).stats().energy;
+        let mut telem = lock_pt(&h.telem);
         telem.baseline_energy = energy;
         telem.paint_cells_total = telem
             .paint_cells_total
@@ -950,9 +1006,9 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimUndo(
             return JNI_FALSE;
         };
         sync_gpu_occ_back(h);
-        let changed = h.sim.lock().unwrap().undo_stroke();
+        let changed = lock_pt(&h.sim).undo_stroke();
         if changed {
-            h.backend.lock().unwrap().dirty = true;
+            lock_pt(&h.backend).dirty = true;
             JNI_TRUE
         } else {
             JNI_FALSE
@@ -975,10 +1031,10 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimClearPaint
         // The core does not expose an atomic clear_paint yet; a loop of
         // undo_stroke reaches the same terminal state and is what the desktop
         // reference does too. Bounded by the undo stack cap in coulomb-core.
-        let mut sim = h.sim.lock().unwrap();
+        let mut sim = lock_pt(&h.sim);
         while sim.undo_stroke() {}
         drop(sim);
-        h.backend.lock().unwrap().dirty = true;
+        lock_pt(&h.backend).dirty = true;
     })
 }
 
@@ -1001,7 +1057,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimAutoTemper
             return f64::NAN;
         };
         let samples = samples.max(1) as usize;
-        let mut sim = h.sim.lock().unwrap();
+        let mut sim = lock_pt(&h.sim);
         sim.auto_temperature(target, samples)
     })
 }
@@ -1020,14 +1076,14 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimAddUniform
         let Some(h) = (unsafe { handle_from(ptr) }) else {
             return;
         };
-        let mut sim = h.sim.lock().unwrap();
+        let mut sim = lock_pt(&h.sim);
         sim.add_uniform_charges();
         drop(sim);
         // Reseeding resets the "energy drop since last paint" baseline so the
         // diagnostic one-liner reflects the settling of the fresh gas, not an
         // accumulated drop against a bygone arrangement.
-        let energy = h.sim.lock().unwrap().stats().energy;
-        let mut telem = h.telem.lock().unwrap();
+        let energy = lock_pt(&h.sim).stats().energy;
+        let mut telem = lock_pt(&h.telem);
         telem.baseline_energy = energy;
     })
 }
@@ -1058,11 +1114,11 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetParam(
         if dirty_gpu {
             sync_gpu_occ_back(h);
         }
-        let mut sim = h.sim.lock().unwrap();
+        let mut sim = lock_pt(&h.sim);
         apply_param(&mut sim, key, value);
         drop(sim);
         if dirty_gpu {
-            h.backend.lock().unwrap().dirty = true;
+            lock_pt(&h.backend).dirty = true;
         }
     })
 }
@@ -1083,7 +1139,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimGetParam(
             Ok(s) => s.into(),
             Err(_) => return f64::NAN,
         };
-        let sim = h.sim.lock().unwrap();
+        let sim = lock_pt(&h.sim);
         read_param(&sim, &key)
     })
 }
@@ -1116,7 +1172,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadParams
         if any_rebuild {
             sync_gpu_occ_back(h);
         }
-        let mut sim = h.sim.lock().unwrap();
+        let mut sim = lock_pt(&h.sim);
         for (k, val) in obj {
             if let Some(f) = val.as_f64() {
                 apply_param(&mut sim, k.clone(), f);
@@ -1124,7 +1180,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadParams
         }
         drop(sim);
         if any_rebuild {
-            h.backend.lock().unwrap().dirty = true;
+            lock_pt(&h.backend).dirty = true;
         }
         JNI_TRUE
     })
@@ -1141,7 +1197,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimDumpParams
         let Some(h) = (unsafe { handle_from(ptr) }) else {
             return std::ptr::null_mut();
         };
-        let sim = h.sim.lock().unwrap();
+        let sim = lock_pt(&h.sim);
         let json = params_to_json(sim.params()).to_string();
         match env.new_string(&json) {
             Ok(js) => js.into_raw(),
@@ -1174,7 +1230,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadPreset
         // arrangement - the captain's mental model of Reset is "give me a
         // fresh gas", not "re-emit the same arrangement a stride placement
         // produced"; the stride variant stays reserved for coulomb-validate.
-        let sim_ref = h.sim.lock().unwrap();
+        let sim_ref = lock_pt(&h.sim);
         let mut params = sim_ref.params().clone();
         let prev_n = sim_ref.occupancy().iter().filter(|&&b| b).count();
         drop(sim_ref);
@@ -1215,23 +1271,42 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadPreset
             _ => return JNI_FALSE,
         };
         let energy = fresh.stats().energy;
-        *h.sim.lock().unwrap() = fresh;
+        let fresh_particles = fresh.stats().particles;
+        let fresh_edge_nonzero = fresh.u_edge().iter().filter(|&&v| v.abs() > 1e-6).count();
+        *lock_pt(&h.sim) = fresh;
         // Reset the "energy drop" telemetry baseline so the diagnostic
         // overlay's delta reflects the settling after reset, not before.
-        let mut telem = h.telem.lock().unwrap();
+        let mut telem = lock_pt(&h.telem);
         telem.baseline_energy = energy;
         telem.paint_cells_total = 0;
         drop(telem);
+        // Drop any in-flight stroke that was buffered against the old sim's
+        // coordinate system. A stale `Some(InFlightStroke)` would otherwise
+        // land on a `paint_end` after a preset swap and smear the previous
+        // preset's brush onto the new lattice.
+        *lock_pt(&h.stroke) = None;
+        // Force the renderer's packed `occ+paint` scratch to be rebuilt from
+        // the fresh sim on the very next frame. The buffer is already refilled
+        // every frame, but clearing it here is the explicit matching bookend
+        // to the fresh-Sim swap - a shorter scratch triggers a `reserve` in
+        // the render path and makes the "I replaced the state wholesale"
+        // intent legible to anyone reading `nativeSimLoadPreset`.
+        lock_pt(&h.occ_scratch).clear();
         // Fresh Sim means the GPU state is stale by construction - drop the
         // cached GpuSim and clear the mirrored occupancy so the next GPU
         // tick rebuilds from the fresh CPU snapshot.
-        let mut backend_state = h.backend.lock().unwrap();
+        let mut backend_state = lock_pt(&h.backend);
         backend_state.gpu = None;
         backend_state.gpu_occ = None;
         backend_state.dirty = true;
         backend_state.gpu_iteration = 0;
         backend_state.gpu_proposed = 0;
         backend_state.gpu_accepted = 0;
+        drop(backend_state);
+        info!(
+            "nativeSimLoadPreset: {name} applied; particles={fresh_particles} \
+             u_edge_nonzero={fresh_edge_nonzero} energy={energy:.3}"
+        );
         JNI_TRUE
     })
 }
@@ -1255,7 +1330,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSnapshotPn
             return std::ptr::null_mut();
         };
         let bytes = {
-            let sim = h.sim.lock().unwrap();
+            let sim = lock_pt(&h.sim);
             let w = sim.params().w as u32;
             let hgt = sim.params().h as u32;
             let occ = sim.occupancy();
@@ -1371,18 +1446,18 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimStep(
         let iter_before;
         let iter_after;
         {
-            let mut sim = h.sim.lock().unwrap();
+            let mut sim = lock_pt(&h.sim);
             iter_before = sim.stats().iteration;
             sim.step();
             iter_after = sim.stats().iteration;
         }
         let dt = started.elapsed().as_secs_f64();
         let done = iter_after - iter_before;
-        let mut telem = h.telem.lock().unwrap();
+        let mut telem = lock_pt(&h.telem);
         telem.last_tick_wall = Some(started);
         telem.last_tick_iterations = done;
         if dt > 0.0 {
-            let batch = h.sim.lock().unwrap().params().batch as f64;
+            let batch = lock_pt(&h.sim).params().batch as f64;
             telem.last_mps = (done as f64) * batch / dt;
         }
         done as jlong
@@ -1418,7 +1493,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRecreate(
         if h_px <= 0 || w_px <= 0 || n_particles < 0 {
             return JNI_FALSE;
         }
-        let base = h.sim.lock().unwrap().params().clone();
+        let base = lock_pt(&h.sim).params().clone();
         let charge = apply_charge_sign(base.charge, charge_sign);
         let params = Params {
             h: h_px as usize,
@@ -1429,8 +1504,8 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRecreate(
         };
         let fresh = Sim::new_blank(params, n_particles as usize);
         let energy = fresh.stats().energy;
-        *h.sim.lock().unwrap() = fresh;
-        let mut telem = h.telem.lock().unwrap();
+        *lock_pt(&h.sim) = fresh;
+        let mut telem = lock_pt(&h.telem);
         telem.baseline_energy = energy;
         telem.paint_cells_total = 0;
         JNI_TRUE
@@ -1480,7 +1555,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRebuildWit
             .iter()
             .map(|&b| (b as u8) as f64 / 255.0)
             .collect();
-        let base = h.sim.lock().unwrap().params().clone();
+        let base = lock_pt(&h.sim).params().clone();
         let charge = apply_charge_sign(base.charge, charge_sign);
         let params = Params {
             h: h_px as usize,
@@ -1492,8 +1567,8 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRebuildWit
         let occ0 = strided_occ_bool(params.h, params.w, n_particles as usize, &cov);
         let fresh = Sim::new(params, cov, occ0, 1.0, true);
         let energy = fresh.stats().energy;
-        *h.sim.lock().unwrap() = fresh;
-        let mut telem = h.telem.lock().unwrap();
+        *lock_pt(&h.sim) = fresh;
+        let mut telem = lock_pt(&h.telem);
         telem.baseline_energy = energy;
         telem.paint_cells_total = 0;
         JNI_TRUE
@@ -1582,11 +1657,17 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimStats<'a>(
     guard(std::ptr::null_mut(), || {
         // SAFETY: caller-owned handle; see handle_from doc comment.
         let Some(h) = (unsafe { handle_from(ptr) }) else {
+            warn!("nativeSimStats: null handle, returning null array");
             return std::ptr::null_mut();
         };
-        let cpu_stats = h.sim.lock().unwrap().stats();
-        let telem = h.telem.lock().unwrap();
-        let backend_state = h.backend.lock().unwrap();
+        let cpu_stats = lock_pt(&h.sim).stats();
+        let telem = lock_pt(&h.telem);
+        let backend_state = lock_pt(&h.backend);
+        let branch = if backend_state.active == Backend::Gpu && backend_state.gpu.is_some() {
+            "gpu"
+        } else {
+            "cpu"
+        };
         // When GPU owns the live engine, surface its iteration / acceptance /
         // energy / particle count. Temperature comes from CPU-side Params
         // because that's where the UI slider writes. Batch is the GPU's
@@ -1615,7 +1696,10 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimStats<'a>(
                     cpu_stats.batch as f64,
                 )
             };
-        let total = (h.sim.lock().unwrap().params().h * h.sim.lock().unwrap().params().w) as f64;
+        let total = {
+            let sim = lock_pt(&h.sim);
+            (sim.params().h * sim.params().w) as f64
+        };
         let occupancy = if total > 0.0 { particles / total } else { 0.0 };
         let energy_drop = telem.baseline_energy - energy;
         let vals: [f64; 10] = [
@@ -1632,10 +1716,32 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimStats<'a>(
         ];
         let arr: JDoubleArray = match env.new_double_array(vals.len() as i32) {
             Ok(a) => a,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => {
+                warn!(
+                    "nativeSimStats: new_double_array(len={}) failed: {e:?}",
+                    vals.len()
+                );
+                return std::ptr::null_mut();
+            }
         };
-        if env.set_double_array_region(&arr, 0, &vals).is_err() {
+        if let Err(e) = env.set_double_array_region(&arr, 0, &vals) {
+            warn!("nativeSimStats: set_double_array_region failed: {e:?}");
             return std::ptr::null_mut();
+        }
+        // One-per-second cadence lives on the Kotlin stats-loop side; here we
+        // sample the branch + array length cheaply so a `logcat -s CoulombJni`
+        // during a session confirms the stats pipe is live without needing to
+        // flip Kotlin's info-log gating.
+        static LOG_EVERY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = LOG_EVERY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n % 60 == 0 {
+            info!(
+                "nativeSimStats: branch={branch} len={} iter={} n={} mps={:.1}",
+                vals.len(),
+                vals[0] as u64,
+                vals[1] as u64,
+                vals[5],
+            );
         }
         arr.into_raw()
     })
@@ -1677,11 +1783,11 @@ fn is_gpu_rebuild_key(key: &str) -> bool {
 /// the cache is `None` and this returns immediately.
 fn sync_gpu_occ_back(h: &SimHandle) {
     let occ = {
-        let mut backend_state = h.backend.lock().unwrap();
+        let mut backend_state = lock_pt(&h.backend);
         backend_state.gpu_occ.take()
     };
     if let Some(occ) = occ {
-        let mut sim = h.sim.lock().unwrap();
+        let mut sim = lock_pt(&h.sim);
         if occ.len() == sim.params().h * sim.params().w {
             sim.replace_occupancy(occ);
         }
@@ -1790,9 +1896,9 @@ mod tests {
         let ptr = make_handle(32, 32, 30);
         // SAFETY: handle from make_handle above; not shared.
         let handle = unsafe { &*ptr };
-        let before = handle.sim.lock().unwrap().stats().iteration;
-        handle.sim.lock().unwrap().step_many(5);
-        let after = handle.sim.lock().unwrap().stats().iteration;
+        let before = lock_pt(&handle.sim).stats().iteration;
+        lock_pt(&handle.sim).step_many(5);
+        let after = lock_pt(&handle.sim).stats().iteration;
         assert_eq!(after - before, 5);
         // SAFETY: same handle, single-threaded test.
         unsafe {
@@ -1805,7 +1911,7 @@ mod tests {
         let ptr = make_handle(16, 16, 20);
         // SAFETY: freshly created above.
         let handle = unsafe { &*ptr };
-        let s = handle.sim.lock().unwrap().stats();
+        let s = lock_pt(&handle.sim).stats();
         // Kotlin unpacks a double[9]; the assertions here catch a Stats field
         // rename that would silently shift array positions.
         assert!(s.iteration == 0);
@@ -1823,10 +1929,10 @@ mod tests {
         // SAFETY: freshly created above.
         let handle = unsafe { &*ptr };
         {
-            let mut sim = handle.sim.lock().unwrap();
+            let mut sim = lock_pt(&handle.sim);
             apply_param(&mut sim, "temperature".to_string(), 1234.5);
         }
-        let t = handle.sim.lock().unwrap().params().temperature;
+        let t = lock_pt(&handle.sim).params().temperature;
         assert!((t - 1234.5).abs() < 1e-9);
         // SAFETY: same handle.
         unsafe {
