@@ -23,9 +23,11 @@ android {
 
         // Only the ABIs the Rust cross-compile produces. A device with an
         // unsupported ABI refuses to install rather than crashing at
-        // System.loadLibrary time.
+        // System.loadLibrary time. x86 and x86_64 are included so an x86
+        // Android emulator (the common Windows/WSL host without an
+        // ARM-translation image) can install and run the debug APK.
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
         }
     }
 
@@ -136,6 +138,8 @@ val rustAndroidBuild = tasks.register<Exec>("rustAndroidBuild") {
     outputs.files(
         cargoRoot.resolve("target/aarch64-linux-android/release/libcoulomb_jni.so"),
         cargoRoot.resolve("target/armv7-linux-androideabi/release/libcoulomb_jni.so"),
+        cargoRoot.resolve("target/i686-linux-android/release/libcoulomb_jni.so"),
+        cargoRoot.resolve("target/x86_64-linux-android/release/libcoulomb_jni.so"),
     )
 }
 
@@ -148,6 +152,17 @@ val copyRustJniLibs = tasks.register<Copy>("copyRustJniLibs") {
     }
     from(cargoRoot.resolve("target/armv7-linux-androideabi/release/libcoulomb_jni.so")) {
         into("armeabi-v7a")
+    }
+    // x86 / x86_64 are only used by the emulator (Windows/WSL AVD host without
+    // ARM translation). An emulator is what an agent-run smoke test hits, so
+    // shipping these two ABIs keeps that path alive alongside the hardware
+    // arm64 target the S24 uses. Removing them shrinks the APK by roughly the
+    // size of two libcoulomb_jni copies.
+    from(cargoRoot.resolve("target/i686-linux-android/release/libcoulomb_jni.so")) {
+        into("x86")
+    }
+    from(cargoRoot.resolve("target/x86_64-linux-android/release/libcoulomb_jni.so")) {
+        into("x86_64")
     }
     into(jniLibsDir)
 }

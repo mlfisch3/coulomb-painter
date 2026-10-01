@@ -631,20 +631,59 @@ impl Sim {
         let h = params.h;
         let w = params.w;
         let cov = vec![0.0f64; h * w];
-        let total = h * w;
-        let take = n_particles.min(total);
-        let mut occ = vec![false; total];
-        if take > 0 {
-            // Fixed-point stride so a fractional site count still yields the
-            // requested number without collisions.
-            let stride_num = total as u64;
-            let stride_den = take as u64;
-            for k in 0..take {
-                let idx = ((k as u64 * stride_num) / stride_den) as usize;
-                occ[idx] = true;
+        Self::new(params, cov, strided_occupancy(h, w, n_particles), 1.0, false)
+    }
+
+    /// A procedurally-generated wire-mesh coverage: a uniform grid of
+    /// horizontal + vertical rails `step` cells apart, each `line_width` cells
+    /// thick. The rails become fixed charge the mobile gas has to arrange
+    /// around - the test image the parity harness drives both the desktop
+    /// Python engine and the Android Rust engine on, so a screenshot pair on
+    /// the same seed exercises the same potential and the same geometry.
+    pub fn new_wire_mesh(
+        params: Params,
+        n_particles: usize,
+        step: usize,
+        line_width: usize,
+    ) -> Self {
+        let h = params.h;
+        let w = params.w;
+        let mut cov = vec![0.0f64; h * w];
+        let step = step.max(2);
+        let hw = line_width.max(1) / 2;
+        // Horizontal rails. Coverage is 1.0 inside the rail so `line_blocks`
+        // on at threshold 0.5 blocks the whole rail, matching the desktop
+        // reference's "line_blocks" treatment.
+        let mut y = step;
+        while y < h {
+            let y0 = y.saturating_sub(hw);
+            let y1 = (y + hw + 1).min(h);
+            for ry in y0..y1 {
+                for x in 0..w {
+                    cov[ry * w + x] = 1.0;
+                }
             }
+            y += step;
         }
-        Self::new(params, cov, occ, 1.0, false)
+        // Vertical rails.
+        let mut x = step;
+        while x < w {
+            let x0 = x.saturating_sub(hw);
+            let x1 = (x + hw + 1).min(w);
+            for rx in x0..x1 {
+                for ry in 0..h {
+                    cov[ry * w + rx] = 1.0;
+                }
+            }
+            x += step;
+        }
+        Self::new(
+            params,
+            cov,
+            strided_occupancy(h, w, n_particles),
+            1.0,
+            true,
+        )
     }
 
     // -- energy -------------------------------------------------------
@@ -1129,6 +1168,82 @@ impl Sim {
         self.params.temperature = t;
     }
 
+    /// Live setter for a named scalar parameter.
+    ///
+    /// Categories mirror the desktop reference's `LIVE_KEYS` / `REBUILD_KEYS`
+    /// split: keys whose meaning is a scalar the batch-Metropolis loop reads
+    /// each iteration land straight into `Params`; keys that change the
+    /// interaction kernel or the periodic-vs-hard-wall boundary rebuild the
+    /// kernel and re-project the paint layer onto `u_edge` before the next
+    /// step. Unknown or non-live keys return `false` and change nothing.
+    pub fn set_param(&mut self, key: &str, value: f64) -> bool {
+        // A change to any of these shapes the interaction kernel or the
+        // boundary handling, so rebuilding it is not optional.
+        let rebuild = matches!(
+            key,
+            "strength" | "screening" | "cutoff" | "periodic"
+                | "attract_depth" | "attract_range"
+        );
+        match key {
+            "temperature" => self.params.temperature = value,
+            "charge" => self.params.charge = value,
+            "batch" => {
+                let v = value.max(1.0) as usize;
+                self.params.batch = v;
+                // The live batch may currently be below the new nominal batch
+                // because the fail-streak policy shrank it; jump it up so a
+                // slider raise is felt immediately.
+                if self.live_batch < v {
+                    self.live_batch = v;
+                }
+            }
+            "batch_min" => self.params.batch_min = value.max(1.0) as usize,
+            "batch_decrement" => self.params.batch_decrement = value.max(1.0) as usize,
+            "fail_limit" => self.params.fail_limit = value.max(1.0) as usize,
+            "step_size" => self.params.step_size = value.round().max(1.0) as i32,
+            "strength" => self.params.strength = value,
+            "screening" => self.params.screening = value.max(0.0),
+            "cutoff" => self.params.cutoff = value.max(1.0),
+            "periodic" => self.params.periodic = value != 0.0,
+            "attract_depth" => self.params.attract_depth = value,
+            "attract_range" => self.params.attract_range = value.max(0.0),
+            _ => return false,
+        }
+        if rebuild {
+            self.rebuild_interaction();
+        }
+        true
+    }
+
+    /// Rebuild the interaction kernel and re-project `u_edge` from the
+    /// coverage-and-paint sources. Called after any REBUILD_KEYS change.
+    /// Cheaper than a whole `Sim::new` because occupancy, positions, blocked
+    /// masks and undo history are all kept in place - only the interaction
+    /// geometry moves.
+    pub fn rebuild_interaction(&mut self) {
+        let (rc, kernel) = build_kernel(&self.params, true);
+        let (_rc2, kernel_edge) = build_kernel(&self.params, false);
+        self.rc = rc;
+        self.kernel = kernel;
+        self.kernel_edge = kernel_edge;
+        // Re-project line coverage + paint into the fresh edge kernel. Keeping
+        // paint alive across a cutoff bump is important: a stroke drawn at
+        // cutoff=8 should not evaporate the moment the artist tries cutoff=12.
+        let mut edge = vec![0.0f64; self.cov.len()];
+        for i in 0..edge.len() {
+            edge[i] = self.cov[i] * self.line_density + self.paint[i];
+        }
+        self.u_edge = convolve(
+            &edge,
+            self.params.h,
+            self.params.w,
+            &self.kernel_edge,
+            self.rc,
+            self.params.periodic,
+        );
+        self.energy = self.total_energy();
+    }
+
     pub fn occupancy(&self) -> &[bool] {
         &self.occ
     }
@@ -1168,6 +1283,23 @@ fn slice_patch(src: &[f64], sh: usize, sw: usize, place: &Placement) -> Vec<f64>
     // placement rows/cols are already wrapped, so no extra work here.
     let _ = (ph, sh, sw);
     out
+}
+
+/// Fixed-point stride that scatters `n_particles` across `h * w` sites with
+/// no collisions, shared by the blank and wire-mesh constructors.
+fn strided_occupancy(h: usize, w: usize, n_particles: usize) -> Vec<bool> {
+    let total = h * w;
+    let take = n_particles.min(total);
+    let mut occ = vec![false; total];
+    if take > 0 {
+        let stride_num = total as u64;
+        let stride_den = take as u64;
+        for k in 0..take {
+            let idx = ((k as u64 * stride_num) / stride_den) as usize;
+            occ[idx] = true;
+        }
+    }
+    occ
 }
 
 fn add_into(target: &mut [f64], w: usize, place: &Placement, patch: &[f64]) {

@@ -1,0 +1,5 @@
+scenario: T50k: mid batch-Metropolis, 128x128, one paint stroke
+stage-by-stage comparison:
+stage      T (K)    acc cpu     acc py   <E> cpu (eV)    <E> py (eV)
+    0    50000.0     0.9472     0.9466       1.5936e3       1.5813e3
+pass

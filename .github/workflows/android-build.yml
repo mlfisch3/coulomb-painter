@@ -28,7 +28,17 @@ jobs:
         working-directory: rust
         run: |
           rustup show
-          rustup target add aarch64-linux-android armv7-linux-androideabi
+          # x86 and x86_64 are the ABIs an x86 Android emulator loads. The
+          # xtask cross-compiles all four so an agent-run smoke check on a
+          # WSL/Windows host without ARM translation can still install the
+          # debug APK; CI must install matching rust-std for the pinned
+          # toolchain or `cargo ndk -t x86` errors with "can't find crate for
+          # core" (M3c PR #7 regression).
+          rustup target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi \
+            i686-linux-android \
+            x86_64-linux-android
 
       - name: install cargo-ndk
         run: cargo install cargo-ndk --locked --version ^4
