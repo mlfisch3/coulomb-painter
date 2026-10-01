@@ -715,12 +715,6 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadPreset
             Ok(s) => s.into(),
             Err(_) => return JNI_FALSE,
         };
-        // M3a only recognises "blank"; the real preset library (wire_mesh,
-        // stripes, disc) lands in M4 alongside the drawer that lists them.
-        // Kotlin can still call the entry point without a runtime crash.
-        if name != "blank" {
-            return JNI_FALSE;
-        }
         // Preserve params AND the current particle count so `Reset canvas`
         // gives the user a fresh arrangement of the same charge population;
         // n=0 would leave a blank navy field, which is not the reset the
@@ -729,7 +723,21 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadPreset
         let params = sim_ref.params().clone();
         let n = sim_ref.occupancy().iter().filter(|&&b| b).count();
         drop(sim_ref);
-        let fresh = Sim::new_blank(params, n);
+        let fresh = match name.as_str() {
+            "blank" => Sim::new_blank(params, n),
+            // The wire-mesh preset is the shared parity fixture: a geometric
+            // image both the desktop Python engine and the Android Rust
+            // engine can run at the same seed, so a screenshot pair on
+            // identical particle counts is a honest side-by-side. Step and
+            // line_width are the same shape `docs/screenshots/m3c-wire-mesh.png`
+            // encodes (grid every 16 lattice cells, 1-cell-thick rails on a
+            // 256-wide lattice — subject to the current lattice).
+            "wire_mesh" => {
+                let step = (params.w / 16).max(8);
+                Sim::new_wire_mesh(params, n, step, 1)
+            }
+            _ => return JNI_FALSE,
+        };
         let energy = fresh.stats().energy;
         *h.sim.lock().unwrap() = fresh;
         // Reset the "energy drop" telemetry baseline so the diagnostic

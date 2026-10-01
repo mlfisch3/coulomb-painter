@@ -631,20 +631,59 @@ impl Sim {
         let h = params.h;
         let w = params.w;
         let cov = vec![0.0f64; h * w];
-        let total = h * w;
-        let take = n_particles.min(total);
-        let mut occ = vec![false; total];
-        if take > 0 {
-            // Fixed-point stride so a fractional site count still yields the
-            // requested number without collisions.
-            let stride_num = total as u64;
-            let stride_den = take as u64;
-            for k in 0..take {
-                let idx = ((k as u64 * stride_num) / stride_den) as usize;
-                occ[idx] = true;
+        Self::new(params, cov, strided_occupancy(h, w, n_particles), 1.0, false)
+    }
+
+    /// A procedurally-generated wire-mesh coverage: a uniform grid of
+    /// horizontal + vertical rails `step` cells apart, each `line_width` cells
+    /// thick. The rails become fixed charge the mobile gas has to arrange
+    /// around - the test image the parity harness drives both the desktop
+    /// Python engine and the Android Rust engine on, so a screenshot pair on
+    /// the same seed exercises the same potential and the same geometry.
+    pub fn new_wire_mesh(
+        params: Params,
+        n_particles: usize,
+        step: usize,
+        line_width: usize,
+    ) -> Self {
+        let h = params.h;
+        let w = params.w;
+        let mut cov = vec![0.0f64; h * w];
+        let step = step.max(2);
+        let hw = line_width.max(1) / 2;
+        // Horizontal rails. Coverage is 1.0 inside the rail so `line_blocks`
+        // on at threshold 0.5 blocks the whole rail, matching the desktop
+        // reference's "line_blocks" treatment.
+        let mut y = step;
+        while y < h {
+            let y0 = y.saturating_sub(hw);
+            let y1 = (y + hw + 1).min(h);
+            for ry in y0..y1 {
+                for x in 0..w {
+                    cov[ry * w + x] = 1.0;
+                }
             }
+            y += step;
         }
-        Self::new(params, cov, occ, 1.0, false)
+        // Vertical rails.
+        let mut x = step;
+        while x < w {
+            let x0 = x.saturating_sub(hw);
+            let x1 = (x + hw + 1).min(w);
+            for rx in x0..x1 {
+                for ry in 0..h {
+                    cov[ry * w + rx] = 1.0;
+                }
+            }
+            x += step;
+        }
+        Self::new(
+            params,
+            cov,
+            strided_occupancy(h, w, n_particles),
+            1.0,
+            true,
+        )
     }
 
     // -- energy -------------------------------------------------------
@@ -1244,6 +1283,23 @@ fn slice_patch(src: &[f64], sh: usize, sw: usize, place: &Placement) -> Vec<f64>
     // placement rows/cols are already wrapped, so no extra work here.
     let _ = (ph, sh, sw);
     out
+}
+
+/// Fixed-point stride that scatters `n_particles` across `h * w` sites with
+/// no collisions, shared by the blank and wire-mesh constructors.
+fn strided_occupancy(h: usize, w: usize, n_particles: usize) -> Vec<bool> {
+    let total = h * w;
+    let take = n_particles.min(total);
+    let mut occ = vec![false; total];
+    if take > 0 {
+        let stride_num = total as u64;
+        let stride_den = take as u64;
+        for k in 0..take {
+            let idx = ((k as u64 * stride_num) / stride_den) as usize;
+            occ[idx] = true;
+        }
+    }
+    occ
 }
 
 fn add_into(target: &mut [f64], w: usize, place: &Placement, patch: &[f64]) {
