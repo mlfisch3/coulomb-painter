@@ -244,18 +244,21 @@ class SimViewModel : ViewModel() {
      * firstmate bug #7 asks for.
      */
     fun resetCanvas() {
+        loadPreset("blank")
+    }
+
+    /**
+     * Swap the sim to a named preset the JNI `nativeSimLoadPreset` recognises
+     * (`blank`, `wire_mesh`, …). The current brush and params are pushed back
+     * onto the fresh sim so a preset switch does not silently reset the
+     * artist's tuning.
+     */
+    fun loadPreset(name: String) {
         if (handle == 0L) return
         viewModelScope.launch(Dispatchers.Default) {
-            CoulombNative.nativeSimLoadPreset(handle, "blank")
-            // A preset load rebuilds the sim from `Params::default()` plus
-            // the current geometry, which resets the interaction cutoff etc.
-            // Push the artist's live tuning back onto the fresh handle so a
-            // Reset canvas does not silently discard slider positions.
+            CoulombNative.nativeSimLoadPreset(handle, name)
             pushBrushToNative()
             pushParamsToNative()
-            // Reset baseline energy so the "energy drop" telemetry does
-            // not stay pinned to the pre-reset baseline. Cheap since it
-            // just reads current stats.
             onAdapterInfoRefresh()
         }
     }

@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -66,6 +67,7 @@ fun ParametersDrawer(
     onToggleDiagnostics: (Boolean) -> Unit = {},
     onNewCanvas: () -> Unit = {},
     onResetCanvas: () -> Unit = {},
+    onLoadWireMesh: () -> Unit = {},
     onClose: () -> Unit = {},
 ) {
     ModalDrawerSheet(
@@ -126,6 +128,18 @@ fun ParametersDrawer(
                 iconDescription = "Reset canvas",
                 label = "Reset canvas",
                 onClick = onResetCanvas,
+            )
+            // Shared parity fixture: a wire-mesh grid the desktop Python
+            // engine and the Android Rust engine both run on at matched
+            // seed / cutoff / temperature. Lands via `nativeSimLoadPreset`
+            // ("wire_mesh") → `Sim::new_wire_mesh` on the core side; the
+            // icon is `GridOn` to avoid reusing New-canvas's `Add` or any
+            // other icon in the app (captain "no icon may mean two things").
+            MenuRow(
+                icon = Icons.Filled.GridOn,
+                iconDescription = "Load wire mesh test pattern",
+                label = "Load wire mesh test pattern",
+                onClick = onLoadWireMesh,
             )
             Box(
                 modifier = Modifier
