@@ -69,5 +69,4 @@ private val HELP_TEXT: Map<String, String> = mapOf(
     "brush.hardness" to "How sharply the stroke edge falls off (0=soft, 1=hard).",
     "brush.penetrability" to "Coverage above which paint blocks mobile particles.",
     "brush.coupling" to "Radius over which stroke charge couples to u_edge.",
-    "brush.budget" to "Max stroke length before the brush is cut off.",
 )

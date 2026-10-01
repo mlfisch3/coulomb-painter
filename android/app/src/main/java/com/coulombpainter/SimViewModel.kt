@@ -400,7 +400,6 @@ data class BrushSettings(
     val hardness: Double = 0.5,
     val penetrability: Double = 1.0,
     val coupling: Double = 12.0,
-    val budget: Double = 60.0,
 )
 
 /**
