@@ -177,7 +177,15 @@ private fun handleTouch(
     if (mode == Mode.View) {
         return handleViewGesture(vm, view, event, lattice, viewport, gesture)
     }
-    val sign = if (mode == Mode.Heat) 0.0 else vm.brushSignSnapshot()
+    if (mode == Mode.Heat) {
+        // H5: the per-cell temperature override is GPU-only in the desktop
+        // reference and lives behind a separate kernel. Rather than paint
+        // positive fixed charge silently (the pre-fix behaviour where
+        // paint_begin clamped sign=0 up to +1), we eat the touch so the
+        // "(soon)" segment is honest about doing nothing.
+        return true
+    }
+    val sign = vm.brushSignSnapshot()
     if (vm.handle == 0L) return false
     val t = event.eventTime.toDouble()
     val (lx, ly, inside) = screenToLattice(

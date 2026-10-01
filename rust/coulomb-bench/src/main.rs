@@ -124,6 +124,7 @@ fn main() {
         batch_decrement: 1,
         fail_limit: 12,
         step_size: sc.step_size,
+        ..Params::default()
     };
 
     let mut sim = match GpuSim::new_blank(params, sc.particles) {

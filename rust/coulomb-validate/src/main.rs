@@ -166,6 +166,7 @@ fn run_rust(sc: &Scenario) -> RunResult {
             batch_decrement: sc.batch_decrement,
             fail_limit: sc.fail_limit,
             step_size: sc.step_size,
+            ..Params::default()
         };
         let mut sim = Sim::new_blank(params, sc.particles);
         let mut prev_stats = sim.stats();
@@ -191,6 +192,7 @@ fn run_rust(sc: &Scenario) -> RunResult {
                     hardness: br_cfg.hardness,
                     penetrability: br_cfg.penetrability,
                     coupling: br_cfg.coupling,
+                    ..Brush::default()
                 };
                 let points: Vec<[f64; 2]> = stroke.iter().map(|p| [p.y, p.x]).collect();
                 sim.paint_stroke(&points, &br, true);
@@ -280,6 +282,7 @@ fn run_gpu(sc: &Scenario) -> Result<RunResult, String> {
             batch_decrement: sc.batch_decrement,
             fail_limit: sc.fail_limit,
             step_size: sc.step_size,
+            ..Params::default()
         };
         let mut sim = GpuSim::new_blank(params, sc.particles).map_err(|e| e.to_string())?;
         // Stroke playback is deliberately skipped for the GPU path in M2 - the

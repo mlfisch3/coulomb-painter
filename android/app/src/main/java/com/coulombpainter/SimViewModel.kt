@@ -557,6 +557,7 @@ class SimViewModel : ViewModel() {
                 b.hardness,
                 b.penetrability,
                 b.coupling,
+                b.target.code,
             )
         }
     }
@@ -578,7 +579,35 @@ class SimViewModel : ViewModel() {
             b.hardness,
             b.penetrability,
             b.coupling,
+            b.target.code,
         )
+    }
+
+    /**
+     * Hot-probe the sim with ~60 uphill-move samples at effectively infinite
+     * T, then set the simulation's temperature so about 60% of uphill moves
+     * are accepted. Native entry: `nativeSimAutoTemperature`. Returns the new
+     * temperature in Kelvin, or `null` on failure.
+     */
+    fun autoTemperature(target: Double = 0.6, samples: Long = 60L): Double? {
+        if (handle == 0L) return null
+        val t = CoulombNative.nativeSimAutoTemperature(handle, target, samples)
+        if (!t.isFinite() || t <= 0.0) return null
+        // Mirror what the native side already wrote into Params onto our
+        // snapshot so the drawer slider follows the Auto-T decision.
+        _params.value = _params.value.copy(temperature = t)
+        return t
+    }
+
+    /**
+     * Reseed the mobile gas uniformly across the free cells; the painted
+     * layer stays in place. Native entry: `nativeSimAddUniformCharges`.
+     */
+    fun reseedMobileGas() {
+        if (handle == 0L) return
+        viewModelScope.launch(Dispatchers.Default) {
+            CoulombNative.nativeSimAddUniformCharges(handle)
+        }
     }
 
     /**
@@ -604,6 +633,13 @@ class SimViewModel : ViewModel() {
         pushOne("fail_limit", p.failLimit.toDouble())
         pushOne("step_size", p.stepSize.toDouble())
         pushOne("periodic", if (p.periodic) 1.0 else 0.0)
+        pushOne("cooling", if (p.coolingActive) 1.0 else 0.0)
+        pushOne("auto_cools", if (p.autoCools) 1.0 else 0.0)
+        pushOne("cooling_rate", p.coolingRate)
+        pushOne("schedule", if (p.schedule == "cosine") 1.0 else 0.0)
+        pushOne("reheat_amp", p.reheatAmp)
+        pushOne("reheat_period", p.reheatPeriod.toDouble())
+        pushOne("reheat_decay", p.reheatDecay)
     }
 
     private fun pushOne(key: String, value: Double) {
@@ -688,6 +724,12 @@ data class Viewport(
 
 enum class Mode { Paint, Heat, View }
 
+/**
+ * Which layer a stroke writes into. Mirrors `coulomb-core::BrushTarget`; the
+ * JNI's integer encoding (`code`) is the one the Rust side expects.
+ */
+enum class BrushTarget(val code: Long) { Fixed(0L), Mobile(1L) }
+
 data class BrushSettings(
     val sign: Double = 1.0,
     val magnitude: Double = 4.0,
@@ -697,6 +739,7 @@ data class BrushSettings(
     val hardness: Double = 0.5,
     val penetrability: Double = 1.0,
     val coupling: Double = 12.0,
+    val target: BrushTarget = BrushTarget.Fixed,
 )
 
 /**
@@ -722,9 +765,13 @@ data class ParamsSnapshot(
     val charge: Double = 1.0,
     val attractDepth: Double = 0.0,
     val attractRange: Double = 1.5,
-    val coolingActive: Boolean = true,
+    val coolingActive: Boolean = false,
+    val autoCools: Boolean = true,
     val schedule: String = "geometric",
     val coolingRate: Double = 0.97,
+    val reheatAmp: Double = 1.0,
+    val reheatPeriod: Int = 20_000,
+    val reheatDecay: Double = 0.94,
     val batch: Int = 64,
     val batchMin: Int = 1,
     val batchDecrement: Int = 1,
@@ -746,6 +793,13 @@ data class ParamsSnapshot(
         "fail_limit" -> copy(failLimit = value.toInt().coerceAtLeast(1))
         "step_size" -> copy(stepSize = value.toInt().coerceAtLeast(1))
         "periodic" -> copy(periodic = value != 0.0)
+        "cooling" -> copy(coolingActive = value != 0.0)
+        "auto_cools" -> copy(autoCools = value != 0.0)
+        "cooling_rate" -> copy(coolingRate = value.coerceIn(1e-6, 1.0))
+        "schedule" -> copy(schedule = if (value != 0.0) "cosine" else "geometric")
+        "reheat_amp" -> copy(reheatAmp = value.coerceAtLeast(0.0))
+        "reheat_period" -> copy(reheatPeriod = value.toInt().coerceAtLeast(0))
+        "reheat_decay" -> copy(reheatDecay = value.coerceIn(1e-6, 1.0))
         else -> this
     }
 }

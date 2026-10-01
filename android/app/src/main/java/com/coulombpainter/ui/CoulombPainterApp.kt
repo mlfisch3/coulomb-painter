@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -55,6 +56,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.coulombpainter.BrushTarget
 import com.coulombpainter.CoulombNative
 import com.coulombpainter.Mode
 import com.coulombpainter.SimViewModel
@@ -203,6 +205,10 @@ fun CoulombPainterApp(vm: SimViewModel) {
                     // see the Clear request in context.
                     showClearPaintDialog = true
                 },
+                onReseedGas = {
+                    vm.reseedMobileGas()
+                    coroutineScope.launch { drawerState.close() }
+                },
                 // Close-X in the drawer header: without gestures the artist
                 // previously had no way off this panel. The X sits at the
                 // top-right per captain report and closes the drawer via the
@@ -225,6 +231,21 @@ fun CoulombPainterApp(vm: SimViewModel) {
                     onMenu = { coroutineScope.launch { drawerState.open() } },
                     onToggleRun = { vm.setRunning(!running) },
                     onStep = { vm.step() },
+                    onAutoTemperature = {
+                        coroutineScope.launch {
+                            // 60 Metropolis probes under the sim mutex, so
+                            // yield to Default to keep the main thread free.
+                            val t = withContext(Dispatchers.Default) {
+                                vm.autoTemperature()
+                            }
+                            val msg = if (t != null) {
+                                "Auto-T set T = ${formatK(t)}"
+                            } else {
+                                "Auto-T found no uphill moves at current state"
+                            }
+                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                        }
+                    },
                 )
                 Box(
                     modifier = Modifier
@@ -245,8 +266,10 @@ fun CoulombPainterApp(vm: SimViewModel) {
                 BottomBar(
                     mode = mode,
                     brushSign = brush.sign,
+                    brushTarget = brush.target,
                     onMode = { vm.setMode(it) },
                     onSign = { s -> vm.setBrush(brush.copy(sign = s)) },
+                    onTarget = { t -> vm.setBrush(brush.copy(target = t)) },
                     onBrushMore = { showBrushSheet = true },
                 )
             }
@@ -389,6 +412,7 @@ private fun TopBar(
     onMenu: () -> Unit,
     onToggleRun: () -> Unit,
     onStep: () -> Unit,
+    onAutoTemperature: () -> Unit,
 ) {
     // Top bar honours WindowInsets.statusBars so the icons are not under
     // the notch. Canvas stays edge-to-edge behind it.
@@ -443,7 +467,7 @@ private fun TopBar(
                 tint = CpInk,
             )
         }
-        IconButton(onClick = { /* auto-T toggle lands with M4 */ }) {
+        IconButton(onClick = onAutoTemperature) {
             Icon(
                 Icons.Filled.DeviceThermostat,
                 contentDescription = "Auto temperature",
@@ -489,8 +513,10 @@ private fun StatsBar(stats: CoulombNative.Stats?) {
 private fun BottomBar(
     mode: Mode,
     brushSign: Double,
+    brushTarget: BrushTarget,
     onMode: (Mode) -> Unit,
     onSign: (Double) -> Unit,
+    onTarget: (BrushTarget) -> Unit,
     onBrushMore: () -> Unit,
 ) {
     Row(
@@ -505,7 +531,9 @@ private fun BottomBar(
         Spacer(Modifier.weight(1f))
         BrushChip(
             sign = brushSign,
+            target = brushTarget,
             onSign = onSign,
+            onTarget = onTarget,
             onMore = onBrushMore,
         )
     }
@@ -521,12 +549,19 @@ private fun SegmentedMode(mode: Mode, onMode: (Mode) -> Unit) {
     ) {
         Mode.entries.forEach { m ->
             SegItem(
+                // Heat is advertised as upcoming per H5: the per-cell local
+                // temperature override lives in the GPU-only Python branch,
+                // and porting it exceeds this PR's scope. The segment is
+                // kept visible so artists know the feature is coming; today
+                // Heat selects but paints no charge, same silent no-op as
+                // before this PR - now labelled honestly.
                 label = when (m) {
                     Mode.Paint -> "Paint"
-                    Mode.Heat -> "Heat"
+                    Mode.Heat -> "Heat (soon)"
                     Mode.View -> "View"
                 },
                 selected = m == mode,
+                dim = m == Mode.Heat,
                 onClick = { onMode(m) },
             )
         }
@@ -534,9 +569,18 @@ private fun SegmentedMode(mode: Mode, onMode: (Mode) -> Unit) {
 }
 
 @Composable
-private fun SegItem(label: String, selected: Boolean, onClick: () -> Unit) {
+private fun SegItem(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    dim: Boolean = false,
+) {
     val bg = if (selected) CpAccent.copy(alpha = 0.20f) else Color.Transparent
-    val fg = if (selected) CpAccent else CpDim
+    val fg = when {
+        selected && dim -> CpDim
+        selected -> CpAccent
+        else -> CpDim
+    }
     Box(
         modifier = Modifier
             .clip(RoundedCornerShape(8.dp))
@@ -553,7 +597,9 @@ private fun SegItem(label: String, selected: Boolean, onClick: () -> Unit) {
 @Composable
 private fun BrushChip(
     sign: Double,
+    target: BrushTarget,
     onSign: (Double) -> Unit,
+    onTarget: (BrushTarget) -> Unit,
     onMore: () -> Unit,
 ) {
     Row(
@@ -566,18 +612,41 @@ private fun BrushChip(
     ) {
         SignBadge(label = "+", active = sign >= 0.0, positive = true) { onSign(1.0) }
         SignBadge(label = "-", active = sign < 0.0, positive = false) { onSign(-1.0) }
-        // The thickness pill is a visual token in the mockup; the M4 slider
-        // will replace it with a real control.
-        Box(
-            modifier = Modifier
-                .width(24.dp)
-                .height(4.dp)
-                .clip(RoundedCornerShape(2.dp))
-                .background(CpDimmer),
-        )
+        // Fixed/Mobile target toggle (H18). Fixed stamps painted charge
+        // (default, mirrors desktop); Mobile stamps add/remove the mobile
+        // gas by per-cell probability, so a negative-sign Mobile stroke
+        // deletes a region of charges.
+        TargetBadge(label = "F", active = target == BrushTarget.Fixed) {
+            onTarget(BrushTarget.Fixed)
+        }
+        TargetBadge(label = "M", active = target == BrushTarget.Mobile) {
+            onTarget(BrushTarget.Mobile)
+        }
         IconButton(onClick = onMore, modifier = Modifier.size(28.dp)) {
             Text("...", color = CpInk, fontSize = 14.sp)
         }
+    }
+}
+
+@Composable
+private fun TargetBadge(
+    label: String,
+    active: Boolean,
+    onClick: () -> Unit,
+) {
+    val bg = if (active) CpAccent.copy(alpha = 0.20f) else Color.Transparent
+    val fg = if (active) CpAccent else CpDim
+    Box(
+        modifier = Modifier
+            .size(28.dp)
+            .clip(RoundedCornerShape(999.dp))
+            .background(bg)
+            .pointerInput(Unit) {
+                detectTapGestures(onTap = { onClick() })
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, color = fg, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
     }
 }
 

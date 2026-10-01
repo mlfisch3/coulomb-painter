@@ -54,6 +54,27 @@ pub struct Params {
     pub batch_decrement: usize,
     pub fail_limit: usize,
     pub step_size: i32,
+
+    // cooling schedule. Ported from `coulomb_painter/sim.py:_cool`: a geometric
+    // or cosine (reheat) schedule that moves `temperature` down over time once
+    // `cooling` is on; `auto_cools` controls whether `auto_temperature` turns
+    // cooling on automatically after it picks a starting T.
+    pub cooling: bool,
+    pub auto_cools: bool,
+    pub cooling_rate: f64,
+    pub schedule: CoolingSchedule,
+    pub reheat_amp: f64,
+    pub reheat_period: u64,
+    pub reheat_decay: f64,
+}
+
+/// Which cooling schedule `_cool` runs. Geometric is the plain exponential
+/// decay; Cosine rides a damped reheat wave on top of the same baseline, so
+/// defects can rearrange without melting structure the gas has already found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoolingSchedule {
+    Geometric,
+    Cosine,
 }
 
 impl Default for Params {
@@ -76,6 +97,13 @@ impl Default for Params {
             batch_decrement: 1,
             fail_limit: 12,
             step_size: 2,
+            cooling: false,
+            auto_cools: true,
+            cooling_rate: 0.97,
+            schedule: CoolingSchedule::Geometric,
+            reheat_amp: 1.0,
+            reheat_period: 20_000,
+            reheat_decay: 0.94,
         }
     }
 }
@@ -93,6 +121,17 @@ pub struct Brush {
     pub hardness: f64,
     pub penetrability: f64,
     pub coupling: f64,
+    pub target: BrushTarget,
+}
+
+/// Which layer the brush writes into. `Fixed` stamps repulsive painted charge
+/// (the desktop default) that joins the fixed field via the coupling kernel;
+/// `Mobile` stamps additions/removals of the mobile gas by a per-cell
+/// probability roll driven by the stroke's radial coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrushTarget {
+    Fixed,
+    Mobile,
 }
 
 impl Default for Brush {
@@ -106,6 +145,7 @@ impl Default for Brush {
             hardness: 0.5,
             penetrability: 1.0,
             coupling: 12.0,
+            target: BrushTarget::Fixed,
         }
     }
 }
@@ -504,10 +544,47 @@ fn patch_index(
 
 // One undo record per stroke: contiguous field patches with their target
 // lattice indices, so `undo_stroke` can subtract them back exactly.
+// Fixed strokes record u_edge/paint deltas; mobile strokes record the per-cell
+// adds and removes so undo flips the occupancy back.
 struct StrokeRecord {
+    kind: StrokeKind,
     u_patches: Vec<(Vec<usize>, Vec<usize>, Vec<f64>)>,
     q_patches: Vec<(Vec<usize>, Vec<usize>, Vec<f64>)>,
     b_patches: Vec<(Vec<usize>, Vec<usize>, Vec<bool>)>,
+    // Mobile-stroke per-sample masks of cells that were toggled by this
+    // packet. Positive-sign strokes populate `mobile_adds`; negative-sign
+    // strokes populate `mobile_rems`.
+    mobile_adds: Vec<(Vec<usize>, Vec<usize>, Vec<bool>)>,
+    mobile_rems: Vec<(Vec<usize>, Vec<usize>, Vec<bool>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrokeKind {
+    Fixed,
+    Mobile,
+}
+
+impl StrokeRecord {
+    fn fixed() -> Self {
+        Self {
+            kind: StrokeKind::Fixed,
+            u_patches: Vec::new(),
+            q_patches: Vec::new(),
+            b_patches: Vec::new(),
+            mobile_adds: Vec::new(),
+            mobile_rems: Vec::new(),
+        }
+    }
+    fn mobile() -> Self {
+        Self {
+            kind: StrokeKind::Mobile,
+            u_patches: Vec::new(),
+            q_patches: Vec::new(),
+            b_patches: Vec::new(),
+            mobile_adds: Vec::new(),
+            mobile_rems: Vec::new(),
+        }
+    }
 }
 
 pub struct Sim {
@@ -543,6 +620,14 @@ pub struct Sim {
     dead_proposals: u64,
     fail_streak: u32,
     live_batch: usize,
+
+    // Cooling-schedule state. `base_temp` is the exponentially-decaying
+    // envelope `_cool` works on; `reheat_amp_live` is the amplitude of the
+    // cosine reheat wave, itself damped over time. Both track `temperature`
+    // when `cooling` is off, so a slider move is honoured immediately on the
+    // next tick.
+    base_temp: f64,
+    reheat_amp_live: f64,
 }
 
 // The undo stack cap matches the desktop annealer: 32 strokes is enough for
@@ -602,6 +687,8 @@ impl Sim {
             }
         }
         let live_batch = params.batch.max(params.batch_min);
+        let base_temp = params.temperature;
+        let reheat_amp_live = params.reheat_amp.max(0.0);
         let mut s = Self {
             params: params.clone(),
             rng: Pcg64Mcg::seed_from_u64(params.seed),
@@ -625,6 +712,8 @@ impl Sim {
             dead_proposals: 0,
             fail_streak: 0,
             live_batch,
+            base_temp,
+            reheat_amp_live,
         };
         s.energy = s.total_energy();
         s
@@ -1012,6 +1101,7 @@ impl Sim {
                 self.fail_streak = 0;
                 self.live_batch = p.batch_min.max(self.live_batch.saturating_sub(p.batch_decrement));
             }
+            self.cool();
             return false;
         }
         self.fail_streak = 0;
@@ -1053,7 +1143,142 @@ impl Sim {
             self.energy += de;
             self.accepted += 1;
         }
+        self.cool();
         accept
+    }
+
+    // Advance the cooling schedule by one iteration. Rates are quoted per 1000
+    // iterations in the user-facing params (the loop runs well above a kHz,
+    // so a per-iteration 0.999 would freeze the gas inside a second); we take
+    // the thousandth root here so the slider's units stay the Python ref's.
+    fn cool(&mut self) {
+        let p = &mut self.params;
+        if !p.cooling {
+            self.base_temp = p.temperature;
+            return;
+        }
+        let rate = p.cooling_rate.clamp(1e-6, 1.0).powf(0.001);
+        self.base_temp = (self.base_temp * rate).max(1e-3);
+        if matches!(p.schedule, CoolingSchedule::Cosine) && p.reheat_period > 0 {
+            let decay = p.reheat_decay.clamp(1e-6, 1.0).powf(0.001);
+            self.reheat_amp_live *= decay;
+            let period = p.reheat_period as f64;
+            let phase = 2.0 * std::f64::consts::PI
+                * ((self.iteration % p.reheat_period) as f64)
+                / period;
+            p.temperature =
+                self.base_temp * (1.0 + self.reheat_amp_live * (0.5 - 0.5 * phase.cos()));
+        } else {
+            p.temperature = self.base_temp;
+        }
+    }
+
+    /// Set the simulation's temperature to `target` acceptance probability
+    /// (default 0.6, like the desktop ref). Probes `samples` uphill moves at
+    /// effectively infinite T, restores all iteration counters and occupancy,
+    /// then derives T from `-mean(dE) / (kB * ln(target))`. Returns the T it
+    /// landed on (or the pre-call temperature if no uphill move materialised).
+    ///
+    /// Ported from `coulomb_painter/sim.py:auto_temperature`; batch is forced
+    /// to 1 during probing because a whole-batch dE is a different
+    /// distribution and gives the wrong temperature.
+    pub fn auto_temperature(&mut self, target: f64, samples: usize) -> f64 {
+        let target = target.clamp(1e-6, 1.0 - 1e-6);
+        let saved_occ = self.occ.clone();
+        let saved_pos = self.pos.clone();
+        let saved_energy = self.energy;
+        let saved_iteration = self.iteration;
+        let saved_accepted = self.accepted;
+        let saved_proposed = self.proposed;
+        let saved_dead = self.dead_proposals;
+        let saved_fail_streak = self.fail_streak;
+        let saved_live_batch = self.live_batch;
+        let saved_base_temp = self.base_temp;
+        let saved_amp = self.reheat_amp_live;
+
+        let t_saved = self.params.temperature;
+        let batch_saved = self.params.batch;
+        let cooling_saved = self.params.cooling;
+
+        self.params.temperature = 1e12;
+        self.params.batch = 1;
+        self.params.cooling = false;
+        self.live_batch = 1;
+
+        let mut ups: Vec<f64> = Vec::new();
+        for _ in 0..samples {
+            let e_before = self.energy;
+            self.step();
+            let de = self.energy - e_before;
+            if de > 0.0 {
+                ups.push(de);
+            }
+        }
+
+        self.occ = saved_occ;
+        self.pos = saved_pos;
+        self.energy = saved_energy;
+        self.iteration = saved_iteration;
+        self.accepted = saved_accepted;
+        self.proposed = saved_proposed;
+        self.dead_proposals = saved_dead;
+        self.fail_streak = saved_fail_streak;
+        self.live_batch = saved_live_batch;
+        self.base_temp = saved_base_temp;
+        self.reheat_amp_live = saved_amp;
+
+        self.params.temperature = t_saved;
+        self.params.batch = batch_saved;
+        self.params.cooling = cooling_saved;
+
+        if ups.is_empty() {
+            return t_saved;
+        }
+        let mean_up: f64 = ups.iter().sum::<f64>() / ups.len() as f64;
+        let t_new = -mean_up / (KB_EV * target.ln());
+        if !t_new.is_finite() || t_new <= 0.0 {
+            return t_saved;
+        }
+        self.params.temperature = t_new;
+        self.base_temp = t_new;
+        if self.params.auto_cools {
+            self.params.cooling = true;
+        }
+        t_new
+    }
+
+    /// Re-seed the mobile gas uniformly across free cells while keeping the
+    /// painted layer. The target count is the current occupancy, so the gas
+    /// density after Reseed matches what the artist was tuning. The RNG is
+    /// the sim's own, so repeated taps give different arrangements.
+    ///
+    /// Mirrors `coulomb_painter/sim.py:add_uniform_charges`.
+    pub fn add_uniform_charges(&mut self) {
+        let total = self.params.h * self.params.w;
+        let mut free: Vec<usize> = (0..total).filter(|&i| !self.blocked[i]).collect();
+        let target = self.pos.len().min(free.len());
+        for i in 0..target {
+            let j = i + (self.rng.gen::<u64>() as usize) % (free.len() - i);
+            free.swap(i, j);
+        }
+        let w = self.params.w;
+        self.occ = vec![false; total];
+        for &idx in &free[..target] {
+            self.occ[idx] = true;
+        }
+        self.pos = Vec::with_capacity(target);
+        for y in 0..self.params.h {
+            for x in 0..w {
+                if self.occ[y * w + x] {
+                    self.pos.push((y as i32, x as i32));
+                }
+            }
+        }
+        // Undo of a prior fixed stroke still subtracts the right u_edge /
+        // paint patches, so we keep the stroke stack. Undoing a prior mobile
+        // stroke on a reseeded gas is a weak no-op (adds clear bits that may
+        // not be set), which matches the Python reference's behaviour too.
+        self.energy = self.total_energy();
     }
 
     /// Convenience: run `n` Metropolis iterations.
@@ -1080,6 +1305,9 @@ impl Sim {
     /// `points[i] = [y, x]` in lattice cells. `first = true` at the start of a
     /// stroke opens a new undo record.
     pub fn paint_stroke(&mut self, points: &[[f64; 2]], br: &Brush, first: bool) -> PaintReport {
+        if br.target == BrushTarget::Mobile {
+            return self.paint_stroke_mobile(points, br, first);
+        }
         let p = self.params.clone();
         let q = p.charge;
         let patch = match stroke_patch(points, br, first) {
@@ -1088,11 +1316,7 @@ impl Sim {
         };
 
         if first || self.strokes.is_empty() {
-            self.strokes.push(StrokeRecord {
-                u_patches: Vec::new(),
-                q_patches: Vec::new(),
-                b_patches: Vec::new(),
-            });
+            self.strokes.push(StrokeRecord::fixed());
             if self.strokes.len() > STROKE_UNDO_CAP {
                 self.strokes.remove(0);
             }
@@ -1179,6 +1403,94 @@ impl Sim {
         }
     }
 
+    /// Mobile-target variant of `paint_stroke`: coverage is treated as a
+    /// per-cell probability that this stamp adds (`sign > 0`) or removes
+    /// (`sign < 0`) a particle at that cell. Blocked cells and sites already
+    /// in the wrong state for the operation are skipped. Charge is NOT
+    /// conserved: the painter is a creation tool, not a physics rule. Mirrors
+    /// `coulomb_painter/sim.py:_paint_mobile`.
+    fn paint_stroke_mobile(
+        &mut self,
+        points: &[[f64; 2]],
+        br: &Brush,
+        first: bool,
+    ) -> PaintReport {
+        let p = self.params.clone();
+        let patch = match stroke_patch(points, br, first) {
+            Some(pp) => pp,
+            None => return PaintReport::default(),
+        };
+        let place = match patch_index(patch.y0, patch.x0, patch.ph, patch.pw, p.h, p.w, p.periodic) {
+            Some(pl) => pl,
+            None => return PaintReport::default(),
+        };
+        if first || self.strokes.is_empty() {
+            self.strokes.push(StrokeRecord::mobile());
+            if self.strokes.len() > STROKE_UNDO_CAP {
+                self.strokes.remove(0);
+            }
+        }
+        let cov_sub = slice_patch(&patch.cov, patch.ph, patch.pw, &place);
+        let pw_sub = place.cols.len();
+        let ph_sub = place.rows.len();
+        let mut adds = vec![false; ph_sub * pw_sub];
+        let mut rems = vec![false; ph_sub * pw_sub];
+        let mut added = 0usize;
+        let mut removed = 0usize;
+        let adding = br.sign >= 0.0;
+        for (ri, &row) in place.rows.iter().enumerate() {
+            for (ci, &col) in place.cols.iter().enumerate() {
+                let prob = cov_sub[ri * pw_sub + ci].clamp(0.0, 1.0);
+                if prob <= 0.0 {
+                    continue;
+                }
+                let r: f64 = self.rng.gen();
+                if r >= prob {
+                    continue;
+                }
+                let idx = row * p.w + col;
+                if adding {
+                    if !self.occ[idx] && !self.blocked[idx] {
+                        self.occ[idx] = true;
+                        adds[ri * pw_sub + ci] = true;
+                        added += 1;
+                    }
+                } else if self.occ[idx] {
+                    self.occ[idx] = false;
+                    rems[ri * pw_sub + ci] = true;
+                    removed += 1;
+                }
+            }
+        }
+        if added + removed > 0 {
+            let rec = self.strokes.last_mut().unwrap();
+            if added > 0 {
+                rec.mobile_adds
+                    .push((place.rows.clone(), place.cols.clone(), adds));
+            }
+            if removed > 0 {
+                rec.mobile_rems
+                    .push((place.rows.clone(), place.cols.clone(), rems));
+            }
+            let w = p.w;
+            self.pos.clear();
+            for y in 0..p.h {
+                for x in 0..w {
+                    if self.occ[y * w + x] {
+                        self.pos.push((y as i32, x as i32));
+                    }
+                }
+            }
+            self.energy = self.total_energy();
+        }
+        PaintReport {
+            painted_cells: cov_sub.iter().filter(|&&v| v > 0.0).count(),
+            charge: 0.0,
+            blocked_new: 0,
+            de_field: 0.0,
+        }
+    }
+
     /// Subtract the last stroke's charge and painted-block flags exactly.
     /// Any annealing that ran between paint and undo stays: the gas keeps
     /// whatever arrangement it found. Matches `undo_stroke` in the reference.
@@ -1188,6 +1500,15 @@ impl Sim {
             None => return false,
         };
         let w = self.params.w;
+        match rec.kind {
+            StrokeKind::Fixed => self.undo_fixed(&rec, w),
+            StrokeKind::Mobile => self.undo_mobile(&rec),
+        }
+        self.energy = self.total_energy();
+        true
+    }
+
+    fn undo_fixed(&mut self, rec: &StrokeRecord, w: usize) {
         for (rows, cols, sub) in &rec.u_patches {
             for (ri, &row) in rows.iter().enumerate() {
                 for (ci, &col) in cols.iter().enumerate() {
@@ -1223,8 +1544,44 @@ impl Sim {
         for i in 0..self.blocked.len() {
             self.blocked[i] = self.line_blocked[i] || self.paint_blocked[i];
         }
-        self.energy = self.total_energy();
-        true
+    }
+
+    fn undo_mobile(&mut self, rec: &StrokeRecord) {
+        let w = self.params.w;
+        for (rows, cols, mask) in &rec.mobile_adds {
+            let pw = cols.len();
+            for (ri, &row) in rows.iter().enumerate() {
+                for (ci, &col) in cols.iter().enumerate() {
+                    if mask[ri * pw + ci] {
+                        self.occ[row * w + col] = false;
+                    }
+                }
+            }
+        }
+        for (rows, cols, mask) in &rec.mobile_rems {
+            let pw = cols.len();
+            for (ri, &row) in rows.iter().enumerate() {
+                for (ci, &col) in cols.iter().enumerate() {
+                    if mask[ri * pw + ci] {
+                        // Do not restore into a blocked cell: a later paint
+                        // stroke may have blocked the site after the mobile
+                        // removal, and the blocking invariant must hold.
+                        let idx = row * w + col;
+                        if !self.blocked[idx] {
+                            self.occ[idx] = true;
+                        }
+                    }
+                }
+            }
+        }
+        self.pos.clear();
+        for y in 0..self.params.h {
+            for x in 0..w {
+                if self.occ[y * w + x] {
+                    self.pos.push((y as i32, x as i32));
+                }
+            }
+        }
     }
 
     fn rebuild_u_edge(&mut self) {
@@ -1283,7 +1640,15 @@ impl Sim {
                 | "attract_depth" | "attract_range"
         );
         match key {
-            "temperature" => self.params.temperature = value,
+            "temperature" => {
+                self.params.temperature = value;
+                // When cooling is on, raising or lowering the slider should
+                // start cooling from the new value, not from the decayed
+                // baseline. Python ref does the same.
+                if self.params.cooling {
+                    self.base_temp = value;
+                }
+            }
             "charge" => self.params.charge = value,
             "fill" => self.params.fill = value.clamp(0.0, 1.0),
             "batch" => {
@@ -1306,6 +1671,42 @@ impl Sim {
             "periodic" => self.params.periodic = value != 0.0,
             "attract_depth" => self.params.attract_depth = value,
             "attract_range" => self.params.attract_range = value.max(0.0),
+            "cooling" => {
+                let on = value != 0.0;
+                // Toggling cooling on snapshots the current temperature as
+                // the base so the first _cool tick does not jump; toggling
+                // off keeps the live temperature as-is (base_temp will track
+                // via _cool's "off" branch).
+                if on && !self.params.cooling {
+                    self.base_temp = self.params.temperature;
+                    self.reheat_amp_live = self.params.reheat_amp.max(0.0);
+                }
+                self.params.cooling = on;
+            }
+            "auto_cools" => self.params.auto_cools = value != 0.0,
+            "cooling_rate" => self.params.cooling_rate = value.clamp(1e-6, 1.0),
+            "schedule" => {
+                // 0 or any value treated as geometric; 1 or any non-zero mapped
+                // to cosine. A string setter is not available over the raw-f64
+                // JNI; the Kotlin side encodes the two states as 0.0 / 1.0.
+                self.params.schedule = if (value - 1.0).abs() < 0.5 {
+                    CoolingSchedule::Cosine
+                } else {
+                    CoolingSchedule::Geometric
+                };
+                // Reset the live reheat amplitude so toggling to cosine mid-
+                // run does not inherit a long-damped envelope that would make
+                // the first wave invisible.
+                self.reheat_amp_live = self.params.reheat_amp.max(0.0);
+            }
+            "reheat_amp" => {
+                self.params.reheat_amp = value.max(0.0);
+                self.reheat_amp_live = self.params.reheat_amp;
+            }
+            "reheat_period" => {
+                self.params.reheat_period = value.max(0.0) as u64;
+            }
+            "reheat_decay" => self.params.reheat_decay = value.clamp(1e-6, 1.0),
             _ => return false,
         }
         if rebuild {
@@ -1486,6 +1887,7 @@ mod tests {
             batch_decrement: 1,
             fail_limit: 12,
             step_size: 2,
+            ..Params::default()
         }
     }
 
@@ -1644,5 +2046,102 @@ mod tests {
             assert!((u_before[i] - u_after[i]).abs() < 1e-9, "u_edge mismatch at {}", i);
         }
         assert_relative_eq!(sim.total_energy(), e_before, max_relative = 1e-9);
+    }
+
+    #[test]
+    fn cooling_off_tracks_slider() {
+        let mut p = small_params();
+        p.temperature = 10_000.0;
+        p.cooling = false;
+        let mut sim = Sim::new_blank(p, 10);
+        sim.step_many(100);
+        assert!((sim.params().temperature - 10_000.0).abs() < 1e-9);
+        // Slider nudges temperature up; _cool with cooling off syncs base.
+        sim.set_param("temperature", 20_000.0);
+        sim.step();
+        assert!((sim.params().temperature - 20_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cooling_geometric_decays_temperature() {
+        let mut p = small_params();
+        p.temperature = 10_000.0;
+        p.cooling = true;
+        p.cooling_rate = 0.5;
+        p.schedule = CoolingSchedule::Geometric;
+        let mut sim = Sim::new_blank(p, 10);
+        let t0 = sim.params().temperature;
+        sim.step_many(2000);
+        let t1 = sim.params().temperature;
+        assert!(t1 < t0, "expected T to fall under geometric cooling: {} -> {}", t0, t1);
+        // rate=0.5 per 1000 iterations, 2 periods, so T should be ~ T0 / 4.
+        assert!(t1 < 0.5 * t0);
+    }
+
+    #[test]
+    fn auto_temperature_lands_in_range() {
+        let mut p = small_params();
+        p.temperature = 10.0;
+        p.cooling = false;
+        let mut sim = Sim::new_blank(p, 40);
+        let iter_before = sim.stats().iteration;
+        let n_before = sim.occupancy().iter().filter(|&&b| b).count();
+        let t = sim.auto_temperature(0.6, 60);
+        assert!(t > 0.0 && t.is_finite(), "auto_temperature returned {}", t);
+        // Probing must not leak iterations or shift the gas: state is restored
+        // except for the rng advance.
+        assert_eq!(sim.stats().iteration, iter_before);
+        assert_eq!(
+            sim.occupancy().iter().filter(|&&b| b).count(),
+            n_before,
+        );
+    }
+
+    #[test]
+    fn add_uniform_charges_preserves_count_and_paint() {
+        let mut p = small_params();
+        p.h = 24;
+        p.w = 24;
+        p.cutoff = 4.0;
+        let mut sim = Sim::new_blank(p, 30);
+        let br = Brush { thickness: 3.0, coupling: 4.0, penetrability: 0.2, ..Brush::default() };
+        sim.paint_stroke(&[[6.0, 6.0], [10.0, 10.0]], &br, true);
+        let paint_before: Vec<f64> = sim.paint.clone();
+        let blocks_before: Vec<bool> = sim.paint_blocked.clone();
+        let n_before = sim.occupancy().iter().filter(|&&b| b).count();
+        sim.add_uniform_charges();
+        let n_after = sim.occupancy().iter().filter(|&&b| b).count();
+        assert_eq!(n_after, n_before);
+        // Painted charges and painted blocks are untouched.
+        for i in 0..paint_before.len() {
+            assert_eq!(paint_before[i], sim.paint[i]);
+            assert_eq!(blocks_before[i], sim.paint_blocked[i]);
+        }
+    }
+
+    #[test]
+    fn mobile_brush_add_remove_roundtrips_via_undo() {
+        let mut p = small_params();
+        p.h = 24;
+        p.w = 24;
+        p.cutoff = 3.0;
+        let mut sim = Sim::new_blank(p, 20);
+        let occ_before: Vec<bool> = sim.occupancy().to_vec();
+        let n_before = occ_before.iter().filter(|&&b| b).count();
+        let br_add = Brush {
+            thickness: 4.0,
+            coupling: 3.0,
+            sign: 1.0,
+            target: BrushTarget::Mobile,
+            ..Brush::default()
+        };
+        sim.paint_stroke(&[[12.0, 12.0]], &br_add, true);
+        // Adds landed on some empty, non-blocked cells.
+        let n_after_add = sim.occupancy().iter().filter(|&&b| b).count();
+        assert!(n_after_add >= n_before);
+        // Undo brings occupancy back to the pre-stroke snapshot.
+        assert!(sim.undo_stroke());
+        let occ_after_undo: Vec<bool> = sim.occupancy().to_vec();
+        assert_eq!(occ_before, occ_after_undo);
     }
 }
