@@ -1,6 +1,11 @@
 package com.coulombpainter.ui
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.util.Log
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -24,6 +29,7 @@ import androidx.compose.material.icons.filled.DeviceThermostat
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -43,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -59,13 +66,16 @@ import com.coulombpainter.ui.theme.CpInk
 import com.coulombpainter.ui.theme.CpLine
 import com.coulombpainter.ui.theme.CpPanel
 import com.coulombpainter.ui.theme.CpPanel2
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CoulombPainterApp(vm: SimViewModel) {
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val coroutineScope = rememberCoroutineScope()
+    val context = LocalContext.current
 
     val stats by vm.stats.collectAsState()
     val mode by vm.mode.collectAsState()
@@ -76,11 +86,71 @@ fun CoulombPainterApp(vm: SimViewModel) {
     var showBrushSheet by remember { mutableStateOf(false) }
     var showNewCanvasDialog by remember { mutableStateOf(false) }
     var showResetCanvasDialog by remember { mutableStateOf(false) }
+    var showClearPaintDialog by remember { mutableStateOf(false) }
     var helpTopic by remember { mutableStateOf<String?>(null) }
 
     val lattice by vm.lattice.collectAsState()
     val showDiagnostics by vm.showDiagnostics.collectAsState()
     val drawerIsOpen = drawerState.isOpen || drawerState.targetValue == DrawerValue.Open
+
+    // New-canvas dialog state - preserved across the image-picker roundtrip
+    // so an uploaded coverage image survives the launcher's own recomposition.
+    var canvasSpec by remember {
+        mutableStateOf(
+            NewCanvasSpec(
+                h = 512,
+                w = 512,
+                fillFraction = 0.35,
+                chargeSign = 1,
+                seed = 0L,
+                preset = "blank",
+            )
+        )
+    }
+    var coverageLabel by remember { mutableStateOf<String?>(null) }
+
+    // Captain parity gap H7: pending snapshot bytes queued while the SAF
+    // CreateDocument launcher opens. Kept as a composable-scope reference
+    // because the SAF result callback fires after the ViewModel's suspend
+    // snapshot has returned, so the bytes need somewhere to live.
+    val pendingSnapshotRef = remember { object { var bytes: ByteArray? = null } }
+
+    // SAF: save the snapshot to a user-chosen location. Mime image/png is
+    // the only one the Rust encoder produces; the suggested filename is
+    // generated at launch time.
+    val snapshotLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("image/png")
+    ) { uri: Uri? ->
+        val bytes = pendingSnapshotRef.bytes
+        pendingSnapshotRef.bytes = null
+        if (uri != null && bytes != null) {
+            coroutineScope.launch(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                }.onFailure { Log.w("CoulombPainter", "snapshot write failed: $it") }
+            }
+        }
+    }
+
+    // Captain parity gap H8: image upload. The picker returns a content URI;
+    // we decode the full-resolution bitmap, downscale to the New Canvas
+    // dialog's current resolution, and read luminance into a ByteArray that
+    // the dialog surfaces to the Create button.
+    val imagePickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            coroutineScope.launch(Dispatchers.IO) {
+                val decoded = decodeCoverageBytes(context, uri, canvasSpec.h, canvasSpec.w)
+                if (decoded != null) {
+                    canvasSpec = canvasSpec.copy(coverageBytes = decoded)
+                    coverageLabel = uri.lastPathSegment ?: "image"
+                } else {
+                    Log.w("CoulombPainter", "image decode failed for $uri")
+                }
+            }
+        }
+    }
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -110,6 +180,29 @@ fun CoulombPainterApp(vm: SimViewModel) {
                     vm.loadPreset("disc")
                     coroutineScope.launch { drawerState.close() }
                 },
+                onSnapshot = {
+                    coroutineScope.launch {
+                        val bytes = vm.snapshotPng()
+                        if (bytes != null && bytes.isNotEmpty()) {
+                            pendingSnapshotRef.bytes = bytes
+                            val name = "coulomb-painter-${System.currentTimeMillis()}.png"
+                            snapshotLauncher.launch(name)
+                        } else {
+                            Log.w("CoulombPainter", "snapshot returned empty bytes")
+                        }
+                    }
+                    coroutineScope.launch { drawerState.close() }
+                },
+                onUndoStroke = {
+                    vm.undo()
+                    coroutineScope.launch { drawerState.close() }
+                },
+                onClearPaint = {
+                    // Destructive op: route through confirmation dialog per
+                    // captain rule. The drawer stays open so the artist can
+                    // see the Clear request in context.
+                    showClearPaintDialog = true
+                },
                 // Close-X in the drawer header: without gestures the artist
                 // previously had no way off this panel. The X sits at the
                 // top-right per captain report and closes the drawer via the
@@ -131,6 +224,7 @@ fun CoulombPainterApp(vm: SimViewModel) {
                     running = running,
                     onMenu = { coroutineScope.launch { drawerState.open() } },
                     onToggleRun = { vm.setRunning(!running) },
+                    onStep = { vm.step() },
                 )
                 Box(
                     modifier = Modifier
@@ -174,10 +268,37 @@ fun CoulombPainterApp(vm: SimViewModel) {
     }
     if (showNewCanvasDialog) {
         NewCanvasDialog(
+            initial = canvasSpec,
+            coverageLabel = coverageLabel,
             onDismiss = { showNewCanvasDialog = false },
-            onConfirm = {
-                // Real rebuild lands with M4; for now the dialog just closes
-                // and takes the drawer with it, matching the reset flow.
+            onPickImage = { imagePickerLauncher.launch("image/*") },
+            onConfirm = { spec ->
+                canvasSpec = spec
+                val nParticles = (spec.fillFraction * spec.h * spec.w).toInt().coerceAtLeast(0)
+                val cov = spec.coverageBytes
+                when {
+                    cov != null && cov.size == spec.h * spec.w -> {
+                        vm.rebuildWithCoverage(
+                            h = spec.h,
+                            w = spec.w,
+                            seed = spec.seed,
+                            nParticles = nParticles,
+                            chargeSign = spec.chargeSign,
+                            cov = cov,
+                        )
+                    }
+                    spec.preset == "wire_mesh" -> {
+                        // The wire-mesh preset still goes through the Rust
+                        // preset path so coverage is procedural; recreate
+                        // first to pick up the aspect/resolution change,
+                        // then load the preset to overlay the rails.
+                        vm.recreate(spec.h, spec.w, spec.seed, nParticles, spec.chargeSign)
+                        vm.loadPreset("wire_mesh")
+                    }
+                    else -> {
+                        vm.recreate(spec.h, spec.w, spec.seed, nParticles, spec.chargeSign)
+                    }
+                }
                 showNewCanvasDialog = false
                 coroutineScope.launch { drawerState.close() }
             },
@@ -193,9 +314,67 @@ fun CoulombPainterApp(vm: SimViewModel) {
             },
         )
     }
+    if (showClearPaintDialog) {
+        ClearPaintDialog(
+            onCancel = { showClearPaintDialog = false },
+            onConfirm = {
+                vm.clearPaint()
+                showClearPaintDialog = false
+                coroutineScope.launch { drawerState.close() }
+            },
+        )
+    }
     helpTopic?.let {
         HelpTooltip(topic = it, onDismiss = { helpTopic = null })
     }
+}
+
+/**
+ * Decode a picked image into a raw grayscale coverage buffer of exactly
+ * `h * w` bytes. The incoming bitmap is downsampled on load with
+ * `inSampleSize` to keep peak memory bounded before the final `createScaledBitmap`
+ * matches the target lattice. Luminance uses the Rec. 601 weights so a
+ * photo's blacks (desired as line charge) and whites (desired as empty) map
+ * the way an artist expects. Returns null on any failure.
+ */
+private suspend fun decodeCoverageBytes(
+    context: android.content.Context,
+    uri: Uri,
+    h: Int,
+    w: Int,
+): ByteArray? = withContext(Dispatchers.IO) {
+    runCatching {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, bounds)
+        }
+        val longest = maxOf(bounds.outWidth, bounds.outHeight, 1)
+        val target = maxOf(h, w)
+        var sample = 1
+        while (longest / (sample * 2) >= target) sample *= 2
+        val options = BitmapFactory.Options().apply { inSampleSize = sample }
+        val decoded: Bitmap = context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, options)
+        } ?: return@runCatching null
+        val scaled = Bitmap.createScaledBitmap(decoded, w, h, true)
+        if (scaled !== decoded) decoded.recycle()
+        val pixels = IntArray(w * h)
+        scaled.getPixels(pixels, 0, w, 0, 0, w, h)
+        scaled.recycle()
+        val out = ByteArray(w * h)
+        // Invert luminance so dark pixels (ink) become high coverage. A
+        // photographic line drawing then maps to the "line charges here"
+        // expectation without the user flipping colors first.
+        for (i in pixels.indices) {
+            val p = pixels[i]
+            val r = (p shr 16) and 0xFF
+            val g = (p shr 8) and 0xFF
+            val b = p and 0xFF
+            val luma = (0.299 * r + 0.587 * g + 0.114 * b).toInt().coerceIn(0, 255)
+            out[i] = (255 - luma).toByte()
+        }
+        out
+    }.getOrNull()
 }
 
 fun Mode.next(): Mode = when (this) {
@@ -209,6 +388,7 @@ private fun TopBar(
     running: Boolean,
     onMenu: () -> Unit,
     onToggleRun: () -> Unit,
+    onStep: () -> Unit,
 ) {
     // Top bar honours WindowInsets.statusBars so the icons are not under
     // the notch. Canvas stays edge-to-edge behind it.
@@ -216,7 +396,13 @@ private fun TopBar(
     // Firstmate bug #5: no lightning-bolt icons anywhere. The former "New
     // canvas" bolt is gone (Reset canvas now lives in the hamburger menu);
     // the former "Auto temperature" bolt is a DeviceThermostat. Menu and
-    // pause icons remain distinct.
+    // pause/step icons remain distinct.
+    //
+    // Captain parity gap H19: Freeze (same affordance as the previous
+    // Pause/Resume toggle - paint still writes while physics ticks are
+    // suppressed) plus a Step button that advances exactly one iteration
+    // whether or not the annealer is frozen. The desktop reference uses
+    // Freeze + Step together as the artist's "paint without physics" surface.
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -237,19 +423,25 @@ private fun TopBar(
                 .weight(1f)
                 .padding(horizontal = 8.dp),
         )
-        // Log the tap so logcat proves the click reached the ViewModel.
-        // `running` observed and re-rendered means the icon actually flips
-        // between pause/play when tapped now that the physics surface
-        // honours the running flag.
         IconButton(onClick = {
-            Log.d("CoulombPainter", "play tapped (running=$running)")
+            Log.d("CoulombPainter", "freeze tapped (running=$running)")
             onToggleRun()
         }) {
             if (running) {
-                Icon(Icons.Filled.Pause, contentDescription = "Pause", tint = CpInk)
+                Icon(Icons.Filled.Pause, contentDescription = "Freeze", tint = CpInk)
             } else {
                 Icon(Icons.Filled.PlayArrow, contentDescription = "Resume", tint = CpInk)
             }
+        }
+        IconButton(onClick = {
+            Log.d("CoulombPainter", "step tapped")
+            onStep()
+        }) {
+            Icon(
+                Icons.Filled.SkipNext,
+                contentDescription = "Step one iteration",
+                tint = CpInk,
+            )
         }
         IconButton(onClick = { /* auto-T toggle lands with M4 */ }) {
             Icon(
@@ -469,6 +661,40 @@ private fun ResetCanvasDialog(
         confirmButton = {
             androidx.compose.material3.TextButton(onClick = onConfirm) {
                 Text("Reset")
+            }
+        },
+        dismissButton = {
+            androidx.compose.material3.TextButton(onClick = onCancel) {
+                Text("Cancel")
+            }
+        },
+    )
+}
+
+/**
+ * Captain destructive-action rule: Clear paint discards every painted
+ * stroke, so the confirmation reads out what will be lost and offers an
+ * explicit Cancel next to a destructively-tinted Clear button.
+ */
+@Composable
+private fun ClearPaintDialog(
+    onCancel: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Clear painted charges?") },
+        text = {
+            Text(
+                "Every painted stroke on this canvas will be removed. " +
+                    "The mobile particles stay in place; only the paint layer is cleared. " +
+                    "This cannot be undone.",
+                fontSize = 13.sp,
+            )
+        },
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = onConfirm) {
+                Text("Clear", color = CpAccentHot)
             }
         },
         dismissButton = {

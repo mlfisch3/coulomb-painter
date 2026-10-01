@@ -25,8 +25,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use coulomb_core::{Brush, Params, Sim};
-use jni::objects::{JClass, JDoubleArray, JObject, JString};
-use jni::sys::{jboolean, jdouble, jlong, JNI_FALSE, JNI_TRUE};
+use jni::objects::{JByteArray, JClass, JDoubleArray, JObject, JString};
+use jni::sys::{jboolean, jdouble, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
 use crate::renderer::Renderer;
@@ -820,21 +820,302 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadPreset
     })
 }
 
-/// Snapshot PNG - stubbed to an empty byte array for M3a. M4 wires the real
-/// PNG encoder once the render pipeline in M3b has produced a rasterised view.
+/// Encode the current CPU sim state as an RGBA PNG the Kotlin side can hand
+/// to a SAF `CreateDocument` writer. The pixel pipeline is intentionally
+/// independent of the wgpu surface so a snapshot works whether or not the
+/// SurfaceView has bound a renderer yet (no race with the render loop, no
+/// GPU readback path to probe). Order per cell: navy background, line-charge
+/// white tint, mobile occupancy amber, painted charge red (+) / blue (-),
+/// painted sign amplified by abs(paint).
 #[no_mangle]
 pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSnapshotPng<'a>(
     env: JNIEnv<'a>,
     _class: JClass<'a>,
-    _ptr: jlong,
+    ptr: jlong,
 ) -> jni::sys::jbyteArray {
     guard(std::ptr::null_mut(), || {
-        let arr = match env.new_byte_array(0) {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return std::ptr::null_mut();
+        };
+        let bytes = {
+            let sim = h.sim.lock().unwrap();
+            let w = sim.params().w as u32;
+            let hgt = sim.params().h as u32;
+            let occ = sim.occupancy();
+            let paint = sim.paint();
+            let cov = sim.cov();
+            encode_snapshot_png(w, hgt, occ, paint, cov)
+        };
+        let bytes = match bytes {
+            Some(b) => b,
+            None => return std::ptr::null_mut(),
+        };
+        let arr = match env.byte_array_from_slice(&bytes) {
             Ok(a) => a,
             Err(_) => return std::ptr::null_mut(),
         };
         arr.into_raw()
     })
+}
+
+fn encode_snapshot_png(
+    w: u32,
+    h: u32,
+    occ: &[bool],
+    paint: &[f64],
+    cov: &[f64],
+) -> Option<Vec<u8>> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let total = (w as usize) * (h as usize);
+    if occ.len() != total || paint.len() != total || cov.len() != total {
+        return None;
+    }
+    let mut rgba = vec![0u8; total * 4];
+    for i in 0..total {
+        // Base navy. Captain painter palette: a dim backdrop so painted
+        // layers stay legible when a snapshot is pasted into a design doc.
+        let mut r = 10u16;
+        let mut g = 20u16;
+        let mut b = 40u16;
+        // Line charges: a white-ish tint proportional to coverage.
+        let cv = cov[i].clamp(0.0, 1.0);
+        if cv > 0.0 {
+            let t = (cv * 240.0) as u16;
+            r = r.saturating_add(t);
+            g = g.saturating_add(t);
+            b = b.saturating_add(t);
+        }
+        // Mobile occupancy: amber on top of the base/line.
+        if occ[i] {
+            r = 255;
+            g = 200;
+            b = 60;
+        }
+        // Painted charge: red for +, blue for -. Magnitude saturates the
+        // channel after a small threshold so a wisp of paint reads clearly.
+        let p = paint[i];
+        if p.abs() > 1e-6 {
+            let mag = (p.abs() * 1.0).min(1.0);
+            let t = (mag * 220.0) as u16;
+            if p > 0.0 {
+                r = r.saturating_add(t);
+                g = g.saturating_sub((t / 2).min(g));
+                b = b.saturating_sub((t / 2).min(b));
+            } else {
+                b = b.saturating_add(t);
+                r = r.saturating_sub((t / 2).min(r));
+                g = g.saturating_sub((t / 4).min(g));
+            }
+        }
+        let o = i * 4;
+        rgba[o] = r.min(255) as u8;
+        rgba[o + 1] = g.min(255) as u8;
+        rgba[o + 2] = b.min(255) as u8;
+        rgba[o + 3] = 255;
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut buf, w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(&rgba).ok()?;
+    }
+    Some(buf)
+}
+
+// ---------------------------------------------------------------- rebuild + step
+//
+// Three entry points below belong together: `nativeSimStep` lets the Kotlin
+// top-bar advance one iteration while the sim is otherwise frozen (per
+// captain Freeze/Step pair). `nativeSimRecreate` and
+// `nativeSimRebuildWithCoverage` replace the sim in-place so the Kotlin New
+// Canvas flow can hand the artist a fresh canvas (blank or from an uploaded
+// grayscale image) without allocating a second SimHandle - the renderer and
+// telemetry outlive the swap. See `docs/android-plan.md` §4-5.
+
+/// Advance the sim by exactly one iteration regardless of pause state. The
+/// per-tick telemetry is updated so the stats line still ticks forward on
+/// each tap, matching the desktop reference's single-step affordance.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimStep(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
+    guard(0, || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return 0;
+        };
+        let started = Instant::now();
+        let iter_before;
+        let iter_after;
+        {
+            let mut sim = h.sim.lock().unwrap();
+            iter_before = sim.stats().iteration;
+            sim.step();
+            iter_after = sim.stats().iteration;
+        }
+        let dt = started.elapsed().as_secs_f64();
+        let done = iter_after - iter_before;
+        let mut telem = h.telem.lock().unwrap();
+        telem.last_tick_wall = Some(started);
+        telem.last_tick_iterations = done;
+        if dt > 0.0 {
+            let batch = h.sim.lock().unwrap().params().batch as f64;
+            telem.last_mps = (done as f64) * batch / dt;
+        }
+        done as jlong
+    })
+}
+
+/// Replace the current sim with a fresh blank canvas at (`h`, `w`), seeding
+/// `n_particles` mobile charges and setting `Params.charge` to
+/// `charge_sign * previous_|charge|` so the artist's magnitude is preserved
+/// while the sign flips. `charge_sign` of 0 keeps the previous sign (used
+/// by the "mixed" dialog option, which falls back to positive today - a
+/// per-particle sign distribution is beyond this entry point's scope).
+///
+/// Returns `true` on success. The renderer stays bound; the next render
+/// frame reads the new sim's occupancy and the swapchain's own
+/// `nativeSimSurfaceResize` from Kotlin picks up any aspect change.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRecreate(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    h_px: jlong,
+    w_px: jlong,
+    seed: jlong,
+    n_particles: jlong,
+    charge_sign: jint,
+) -> jboolean {
+    guard(JNI_FALSE, || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return JNI_FALSE;
+        };
+        if h_px <= 0 || w_px <= 0 || n_particles < 0 {
+            return JNI_FALSE;
+        }
+        let base = h.sim.lock().unwrap().params().clone();
+        let charge = apply_charge_sign(base.charge, charge_sign);
+        let params = Params {
+            h: h_px as usize,
+            w: w_px as usize,
+            seed: seed as u64,
+            charge,
+            ..base
+        };
+        let fresh = Sim::new_blank(params, n_particles as usize);
+        let energy = fresh.stats().energy;
+        *h.sim.lock().unwrap() = fresh;
+        let mut telem = h.telem.lock().unwrap();
+        telem.baseline_energy = energy;
+        telem.paint_cells_total = 0;
+        JNI_TRUE
+    })
+}
+
+/// Replace the current sim with a canvas built from a user-supplied grayscale
+/// coverage image. `cov_bytes` is `h_px * w_px` bytes, each 0..=255 (0 =
+/// transparent / no line charge, 255 = full line charge). The Kotlin side
+/// decodes the picked image to this shape via `Bitmap` + `extractAlpha` or a
+/// luminance pass.
+///
+/// Returns `true` on success. `charge_sign` behaves as in `nativeSimRecreate`.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRebuildWithCoverage<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    ptr: jlong,
+    h_px: jlong,
+    w_px: jlong,
+    seed: jlong,
+    n_particles: jlong,
+    charge_sign: jint,
+    cov_bytes: JByteArray<'a>,
+) -> jboolean {
+    guard(JNI_FALSE, || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return JNI_FALSE;
+        };
+        if h_px <= 0 || w_px <= 0 || n_particles < 0 {
+            return JNI_FALSE;
+        }
+        let total = (h_px as usize).saturating_mul(w_px as usize);
+        // JNI's byte array copy to Rust owns the bytes; we convert to f64 in
+        // 0..1 and feed `Sim::new` with line_blocks=true so the lines on an
+        // uploaded wire-mesh image occlude the gas, matching the desktop
+        // behavior for an uploaded PNG.
+        let i8_bytes = match env.convert_byte_array(&cov_bytes) {
+            Ok(v) => v,
+            Err(_) => return JNI_FALSE,
+        };
+        if i8_bytes.len() != total {
+            return JNI_FALSE;
+        }
+        let cov: Vec<f64> = i8_bytes
+            .iter()
+            .map(|&b| (b as u8) as f64 / 255.0)
+            .collect();
+        let base = h.sim.lock().unwrap().params().clone();
+        let charge = apply_charge_sign(base.charge, charge_sign);
+        let params = Params {
+            h: h_px as usize,
+            w: w_px as usize,
+            seed: seed as u64,
+            charge,
+            ..base
+        };
+        let occ0 = strided_occ_bool(params.h, params.w, n_particles as usize, &cov);
+        let fresh = Sim::new(params, cov, occ0, 1.0, true);
+        let energy = fresh.stats().energy;
+        *h.sim.lock().unwrap() = fresh;
+        let mut telem = h.telem.lock().unwrap();
+        telem.baseline_energy = energy;
+        telem.paint_cells_total = 0;
+        JNI_TRUE
+    })
+}
+
+/// Apply a captain-level sign choice to the preserved charge magnitude.
+/// `-1` flips to negative, `+1` to positive, `0` keeps the previous sign.
+fn apply_charge_sign(prev: f64, sign: jint) -> f64 {
+    let mag = prev.abs();
+    match sign {
+        s if s > 0 => mag,
+        s if s < 0 => -mag,
+        _ => if prev < 0.0 { -mag } else { mag },
+    }
+}
+
+/// Place `n` mobile charges on the lattice avoiding cells whose coverage is
+/// above 0.5 (so line charges on an uploaded wire-mesh image are not sat on
+/// at creation time). The order is deterministic strided, matching
+/// `Sim::new_blank`'s initial-condition policy so a snapshot pair across
+/// engines is comparable.
+fn strided_occ_bool(h: usize, w: usize, n: usize, cov: &[f64]) -> Vec<bool> {
+    let total = h * w;
+    let mut occ = vec![false; total];
+    if n == 0 || total == 0 {
+        return occ;
+    }
+    let mut free: Vec<usize> = (0..total).filter(|&i| cov[i] <= 0.5).collect();
+    if free.is_empty() {
+        return occ;
+    }
+    let take = n.min(free.len());
+    for k in 0..take {
+        let idx = (k * free.len()) / take;
+        occ[free.swap_remove(idx.min(free.len() - 1))] = true;
+    }
+    occ
 }
 
 /// `.cmb` save - M5's territory; the stub returns false so the Kotlin UI can
@@ -1063,5 +1344,42 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed["h"], serde_json::json!(p.h));
         assert_eq!(parsed["batch"], serde_json::json!(p.batch));
+    }
+
+    #[test]
+    fn snapshot_png_encodes_header() {
+        // Smoke test: encoder returns bytes starting with the PNG signature.
+        // Full image decode happens on the Kotlin side; here we only prove
+        // the encoder is wired to the sim state without a surface bound.
+        let occ = vec![false; 16 * 16];
+        let paint = vec![0.0f64; 16 * 16];
+        let cov = vec![0.0f64; 16 * 16];
+        let bytes = encode_snapshot_png(16, 16, &occ, &paint, &cov)
+            .expect("encode must succeed on a trivial canvas");
+        assert_eq!(&bytes[0..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    }
+
+    #[test]
+    fn apply_charge_sign_preserves_magnitude() {
+        assert!((apply_charge_sign(2.5, 1) - 2.5).abs() < 1e-9);
+        assert!((apply_charge_sign(2.5, -1) + 2.5).abs() < 1e-9);
+        // sign=0 keeps the previous sign.
+        assert!((apply_charge_sign(-2.5, 0) + 2.5).abs() < 1e-9);
+        assert!((apply_charge_sign(2.5, 0) - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn strided_occ_bool_avoids_covered_cells() {
+        let mut cov = vec![0.0f64; 8 * 8];
+        for i in 0..8 {
+            // Top row is a line charge (coverage=1), so no mobile charge
+            // should land there.
+            cov[i] = 1.0;
+        }
+        let occ = strided_occ_bool(8, 8, 10, &cov);
+        for i in 0..8 {
+            assert!(!occ[i], "placed on covered row");
+        }
+        assert_eq!(occ.iter().filter(|&&b| b).count(), 10);
     }
 }

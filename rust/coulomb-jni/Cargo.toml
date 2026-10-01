@@ -30,6 +30,12 @@ wgpu = { version = "0.19", default-features = false, features = ["wgsl"] }
 bytemuck = { version = "1", features = ["derive"] }
 raw-window-handle = "0.6"
 pollster = "0.3"
+# png encoder for `nativeSimSnapshotPng`. CPU-side render of the current sim
+# state (background + line charge + occupancy + painted charge) into a PNG the
+# Kotlin side can hand to a SAF `CreateDocument` writer. Avoiding the wgpu
+# readback path keeps the snapshot code path independent of whether a surface
+# is currently bound (so the artist can snapshot before the first render frame).
+png = "0.17"
 
 # Android-only bindings for ANativeWindow_fromSurface, used to turn the
 # Java Surface handed to sim_bind_surface into a raw window handle wgpu can
