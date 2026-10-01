@@ -39,6 +39,84 @@ pub struct AdapterInfo {
     pub device_type: String,
 }
 
+/// The on-surface destination rectangle (origin + size in surface pixels) that
+/// a lattice of `(lattice_w, lattice_h)` cells draws into on a surface of
+/// `(surf_w, surf_h)` pixels. The rect preserves the lattice aspect ratio and
+/// is centred inside the surface, so a round brush stroke in surface pixels
+/// corresponds 1:1 to a round stroke in lattice cells (H1).
+///
+/// Lives at module scope rather than inside `mod android` so the host-side
+/// `screenToLattice` test and the Kotlin side (which mirrors this function
+/// one-for-one as `computeDstRect` in `PhysicsSurface.kt`) can share a
+/// single reference implementation across the three languages.
+pub(crate) fn compute_dst_rect(
+    surf_w: u32,
+    surf_h: u32,
+    lattice_w: u32,
+    lattice_h: u32,
+) -> [f32; 4] {
+    if surf_w == 0 || surf_h == 0 || lattice_w == 0 || lattice_h == 0 {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    let sw = surf_w as f32;
+    let sh = surf_h as f32;
+    let lw = lattice_w as f32;
+    let lh = lattice_h as f32;
+    let surf_aspect = sw / sh;
+    let lat_aspect = lw / lh;
+    if surf_aspect > lat_aspect {
+        let dw = sh * lat_aspect;
+        let dx = (sw - dw) * 0.5;
+        [dx, 0.0, dw, sh]
+    } else {
+        let dh = sw / lat_aspect;
+        let dy = (sh - dh) * 0.5;
+        [0.0, dy, sw, dh]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_dst_rect;
+
+    #[test]
+    fn letterbox_square_lattice_on_portrait_surface_centres_vertically() {
+        // A 512x512 lattice on a 1080x1932 painting area (typical S24 after
+        // top/bottom-bar insets) must letterbox to a 1080x1080 rect centred
+        // vertically. Anything else means a round brush stroke stretches
+        // along one axis in lattice space (the H1 regression).
+        let [dx, dy, dw, dh] = compute_dst_rect(1080, 1932, 512, 512);
+        assert!((dx - 0.0).abs() < 1e-3);
+        assert!((dw - 1080.0).abs() < 1e-3);
+        assert!((dh - 1080.0).abs() < 1e-3);
+        assert!((dy - (1932.0 - 1080.0) * 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn letterbox_square_lattice_on_landscape_surface_centres_horizontally() {
+        let [dx, dy, dw, dh] = compute_dst_rect(1932, 1080, 512, 512);
+        assert!((dy - 0.0).abs() < 1e-3);
+        assert!((dh - 1080.0).abs() < 1e-3);
+        assert!((dw - 1080.0).abs() < 1e-3);
+        assert!((dx - (1932.0 - 1080.0) * 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn letterbox_identical_aspect_fills_surface() {
+        let [dx, dy, dw, dh] = compute_dst_rect(1024, 1024, 512, 512);
+        assert!(dx.abs() < 1e-3 && dy.abs() < 1e-3);
+        assert!((dw - 1024.0).abs() < 1e-3);
+        assert!((dh - 1024.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn letterbox_degenerate_dims_return_zero_rect() {
+        assert_eq!(compute_dst_rect(0, 100, 10, 10), [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(compute_dst_rect(100, 0, 10, 10), [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(compute_dst_rect(100, 100, 0, 10), [0.0, 0.0, 0.0, 0.0]);
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 mod stub {
     use super::AdapterInfo;
@@ -66,6 +144,10 @@ mod stub {
         pub fn resize(&mut self, _w: u32, _h: u32) {}
 
         pub fn render(&mut self, _occ: &[u32], _lattice_w: u32, _lattice_h: u32) {}
+
+        /// Viewport source rect in lattice cells. `None` means render the
+        /// whole lattice; `Some([x, y, w, h])` zooms/pans into a sub-region.
+        pub fn set_src_rect(&mut self, _rect: Option<[f32; 4]>) {}
     }
 }
 
@@ -88,14 +170,36 @@ mod android {
     // place so the Rust struct and WGSL declaration cannot silently drift; a
     // mismatched field silently miscolours pixels rather than crashing, and
     // that class of bug is expensive to diagnose on device.
+    //
+    // Field layout matches a WGSL `vec2<u32>` + `vec2<f32>` sharing one 16-byte
+    // block, then two `vec4<f32>`s. `dst_rect` is the on-surface rectangle
+    // (origin + size in surface pixels) the lattice is drawn into; everything
+    // outside it clears to the background colour. `src_rect` is the sub-region
+    // of the lattice sampled into `dst_rect` (origin + size in lattice cells);
+    // the whole lattice is `(0, 0, lattice_w, lattice_h)`. These two together
+    // encode H1 (aspect letterbox) and H11 (view-mode pan + zoom) without
+    // adding a second render pass or stretching cells non-uniformly.
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable)]
     struct RenderParams {
-        w: u32,
-        h: u32,
-        _pad0: u32,
-        _pad1: u32,
+        lattice_w: u32,
+        lattice_h: u32,
+        surf_w: f32,
+        surf_h: f32,
+        dst_x: f32,
+        dst_y: f32,
+        dst_w: f32,
+        dst_h: f32,
+        src_x: f32,
+        src_y: f32,
+        src_w: f32,
+        src_h: f32,
     }
+
+    // The dst-rect helper lives at module scope so a host-side test can
+    // exercise the exact letterbox math the shader applies; see the parent
+    // module's `compute_dst_rect` + its tests.
+    use super::compute_dst_rect;
 
     // Vulkan's dynamic-loading crash on a released ANativeWindow surface is
     // spectacular; keep the pointer and release it on drop, so a lifecycle bug
@@ -194,6 +298,12 @@ mod android {
         occ_lattice_w: u32,
         occ_lattice_h: u32,
         bind_group: wgpu::BindGroup,
+
+        // Caller-provided viewport (origin + size in lattice cells). `None`
+        // renders the whole lattice; `Some(rect)` zooms/pans into a sub-region.
+        // The caller clamps on set, so render-side math only guards against a
+        // post-reset race where the lattice shrank below the stored rect.
+        src_rect: Option<[f32; 4]>,
     }
 
     // The wgpu Surface is `Surface<'static>` because we hand it a heap-owned
@@ -381,6 +491,7 @@ mod android {
                 occ_lattice_w: 1,
                 occ_lattice_h: 1,
                 bind_group,
+                src_rect: None,
             })
         }
 
@@ -398,6 +509,15 @@ mod android {
             self.surface_config.width = w;
             self.surface_config.height = h;
             self.surface.configure(&self.device, &self.surface_config);
+        }
+
+        /// Set the lattice-space viewport the shader samples from. `None`
+        /// draws the whole lattice; `Some([x, y, w, h])` draws a sub-region in
+        /// lattice cells (fractional values are supported). Rust clamps on
+        /// every `render` call so a stale rect from a shrunken lattice does
+        /// not sample out of bounds.
+        pub fn set_src_rect(&mut self, rect: Option<[f32; 4]>) {
+            self.src_rect = rect;
         }
 
         pub fn render(&mut self, occ: &[u32], lattice_w: u32, lattice_h: u32) {
@@ -422,20 +542,48 @@ mod android {
                     &self.occ_buf,
                 );
             }
-            if lattice_w != self.occ_lattice_w || lattice_h != self.occ_lattice_h {
-                self.occ_lattice_w = lattice_w;
-                self.occ_lattice_h = lattice_h;
-                self.queue.write_buffer(
-                    &self.params_uniform,
-                    0,
-                    bytemuck::bytes_of(&RenderParams {
-                        w: lattice_w,
-                        h: lattice_h,
-                        _pad0: 0,
-                        _pad1: 0,
-                    }),
-                );
-            }
+            self.occ_lattice_w = lattice_w;
+            self.occ_lattice_h = lattice_h;
+            let surf_w = self.surface_config.width;
+            let surf_h = self.surface_config.height;
+            let dst = compute_dst_rect(surf_w, surf_h, lattice_w, lattice_h);
+            // Clamp the caller-provided src rect so a late viewport update
+            // after a lattice shrink does not read out of bounds. A rect with
+            // zero area degrades to the full lattice: callers that want to
+            // "clear" the viewport push `(0, 0, 0, 0)` rather than tracking a
+            // separate boolean.
+            let (src_x, src_y, src_w, src_h) = {
+                let lw = lattice_w as f32;
+                let lh = lattice_h as f32;
+                match self.src_rect {
+                    Some([x, y, w, h]) if w > 0.0 && h > 0.0 => {
+                        let cw = w.min(lw).max(1.0);
+                        let ch = h.min(lh).max(1.0);
+                        let cx = x.clamp(0.0, lw - cw);
+                        let cy = y.clamp(0.0, lh - ch);
+                        (cx, cy, cw, ch)
+                    }
+                    _ => (0.0, 0.0, lw, lh),
+                }
+            };
+            self.queue.write_buffer(
+                &self.params_uniform,
+                0,
+                bytemuck::bytes_of(&RenderParams {
+                    lattice_w,
+                    lattice_h,
+                    surf_w: surf_w as f32,
+                    surf_h: surf_h as f32,
+                    dst_x: dst[0],
+                    dst_y: dst[1],
+                    dst_w: dst[2],
+                    dst_h: dst[3],
+                    src_x,
+                    src_y,
+                    src_w,
+                    src_h,
+                }),
+            );
             // The occ slice comes from the CPU sim and is authoritative; on a
             // 512x512 lattice the upload is 1 MiB, which is quick over the
             // Vulkan-shared memory on Adreno 750. We copy only the used prefix
@@ -509,10 +657,21 @@ mod android {
     // dark navy #0d1322 for the empty background. Kept inline rather than
     // sharing coulomb-gpu's render.wgsl because the surface path uses a
     // portrait aspect that shader does not.
+    //
+    // Each fragment first maps to a surface-pixel coordinate; `dst_rect`
+    // selects the lattice-aspect sub-rectangle of the surface that holds the
+    // image, and `src_rect` is the lattice-cell window drawn into that
+    // sub-rectangle. The letterboxed bars outside `dst_rect` paint the empty
+    // background, so a round stroke in surface pixels corresponds 1:1 to a
+    // round stroke in lattice cells (H1), and a shrunk `src_rect` is a
+    // view-mode zoom (H11) with no second render pass or non-uniform sample
+    // scaling.
     const SURFACE_RENDER_WGSL: &str = r#"
 struct Params {
-    w: u32,
-    h: u32,
+    lattice: vec2<u32>,
+    surf: vec2<f32>,
+    dst: vec4<f32>,
+    src: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -538,19 +697,29 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let sx = clamp(u32(in.uv.x * f32(P.w)), 0u, P.w - 1u);
-    let sy = clamp(u32((1.0 - in.uv.y) * f32(P.h)), 0u, P.h - 1u);
-    let v = cells[sy * P.w + sx];
-    if (v & 2u) != 0u {
-        // Painted fixed charge - teal-cyan.
+    let bg = vec4<f32>(0.051, 0.075, 0.133, 1.0);
+    let fx = in.uv.x * P.surf.x;
+    let fy = (1.0 - in.uv.y) * P.surf.y;
+    if (fx < P.dst.x || fx >= P.dst.x + P.dst.z ||
+        fy < P.dst.y || fy >= P.dst.y + P.dst.w) {
+        return bg;
+    }
+    let tx = (fx - P.dst.x) / P.dst.z;
+    let ty = (fy - P.dst.y) / P.dst.w;
+    let lw = P.lattice.x;
+    let lh = P.lattice.y;
+    let fsx = P.src.x + tx * P.src.z;
+    let fsy = P.src.y + ty * P.src.w;
+    let sx = clamp(u32(fsx), 0u, lw - 1u);
+    let sy = clamp(u32(fsy), 0u, lh - 1u);
+    let v = cells[sy * lw + sx];
+    if ((v & 2u) != 0u) {
         return vec4<f32>(0.251, 0.878, 0.816, 1.0);
     }
-    if (v & 1u) != 0u {
-        // Mobile particle - amber-orange.
+    if ((v & 1u) != 0u) {
         return vec4<f32>(1.0, 0.706, 0.42, 1.0);
     }
-    // Empty background - dark navy.
-    return vec4<f32>(0.051, 0.075, 0.133, 1.0);
+    return bg;
 }
 "#;
 }

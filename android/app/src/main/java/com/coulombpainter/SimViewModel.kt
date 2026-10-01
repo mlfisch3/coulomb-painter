@@ -52,8 +52,14 @@ class SimViewModel : ViewModel() {
     private val _showDiagnostics = MutableStateFlow(false)
     val showDiagnostics: StateFlow<Boolean> = _showDiagnostics.asStateFlow()
 
-    private val _gestureView = MutableStateFlow(ViewportGesture())
-    val gestureView: StateFlow<ViewportGesture> = _gestureView.asStateFlow()
+    // Viewport is the sub-rect of the lattice (origin + size in lattice
+    // cells) that the renderer samples into its on-screen letterbox rect.
+    // A zero-size rect means "render the whole lattice". The physics surface
+    // mutates this on view-mode pinch + two-finger pan; the diagnostic
+    // overlay reads it so a developer can confirm what the shader is
+    // actually sampling.
+    private val _viewport = MutableStateFlow(Viewport())
+    val viewport: StateFlow<Viewport> = _viewport.asStateFlow()
 
     // Simple sliding-window FPS. onFrameRendered is called from the render
     // loop each time a swapchain image is queued; the sliding window resets
@@ -86,6 +92,10 @@ class SimViewModel : ViewModel() {
         handle = CoulombNative.nativeSimCreate(h.toLong(), w.toLong(), seed, nParticles.toLong())
         if (handle == 0L) return
         _lattice.value = h
+        // A fresh handle resets the view-mode viewport back to the whole
+        // lattice so a loadPreset or activity recreate does not strand the
+        // user zoomed into coordinates the new lattice may no longer cover.
+        _viewport.value = Viewport()
         // Push the artist's current brush and params into the fresh handle so
         // an app-update or activity recreate does not silently reset the
         // brush to the fat-line default or the interaction cutoff to 12.
@@ -194,15 +204,60 @@ class SimViewModel : ViewModel() {
         }
     }
 
-    fun onGestureTransform(panX: Float, panY: Float, zoom: Float) {
-        // Only View mode consumes pan/pinch; other modes still record the
-        // gesture on the state so the diagnostic overlay can show it.
-        val g = _gestureView.value
-        _gestureView.value = g.copy(
-            panX = g.panX + panX,
-            panY = g.panY + panY,
-            zoom = (g.zoom * zoom).coerceIn(0.25f, 8f),
-        )
+    /**
+     * Apply a view-mode gesture to the viewport. `panX`/`panY` are in lattice
+     * cells (positive = scroll content to the right / down, matching
+     * finger-drag-content follows); `zoomFactor` is multiplicative around the
+     * viewport centre (`> 1` = zoom in). Values are clamped so the viewport
+     * stays inside the lattice.
+     *
+     * `PhysicsSurface` is the only caller; it translates raw pointer deltas
+     * into lattice cells using the current letterbox dst rect. Keeping the
+     * conversion in the touch handler leaves this VM method free of a
+     * surface-size dependency.
+     */
+    fun applyViewGesture(panX: Double, panY: Double, zoomFactor: Double) {
+        val lat = _lattice.value.toDouble()
+        if (lat <= 0.0) return
+        val cur = _viewport.value.ensureSized(lat)
+        val newW = (cur.w / zoomFactor).coerceIn(8.0, lat)
+        val newH = (cur.h / zoomFactor).coerceIn(8.0, lat)
+        // Zoom around the viewport centre so the pinch feels anchored to the
+        // middle of the two fingers rather than the corner.
+        val cx = cur.x + cur.w * 0.5 + panX
+        val cy = cur.y + cur.h * 0.5 + panY
+        val newX = (cx - newW * 0.5).coerceIn(0.0, lat - newW)
+        val newY = (cy - newH * 0.5).coerceIn(0.0, lat - newH)
+        setViewport(newX, newY, newW, newH)
+    }
+
+    /**
+     * Reset the view-mode viewport back to the whole lattice. Called from
+     * the mode-selector when the user leaves View mode so the next entry
+     * does not resume at a stale zoom, and from the diagnostic overlay for
+     * manual recovery.
+     */
+    fun resetViewport() {
+        _viewport.value = Viewport()
+        pushViewportToNative()
+    }
+
+    /**
+     * Set the viewport directly (lattice cells). Values are clamped to the
+     * current lattice. Zero-size clears the viewport.
+     */
+    fun setViewport(x: Double, y: Double, w: Double, h: Double) {
+        val lat = _lattice.value.toDouble()
+        _viewport.value = if (w <= 0.0 || h <= 0.0) {
+            Viewport()
+        } else {
+            val cw = w.coerceIn(1.0, lat)
+            val ch = h.coerceIn(1.0, lat)
+            val cx = x.coerceIn(0.0, lat - cw)
+            val cy = y.coerceIn(0.0, lat - ch)
+            Viewport(cx, cy, cw, ch)
+        }
+        pushViewportToNative()
     }
 
     fun setShowDiagnostics(show: Boolean) { _showDiagnostics.value = show }
@@ -259,6 +314,11 @@ class SimViewModel : ViewModel() {
             CoulombNative.nativeSimLoadPreset(handle, name)
             pushBrushToNative()
             pushParamsToNative()
+            // Reset the viewport so a preset reload (which can swap the
+            // lattice dims under the artist, e.g. wire_mesh -> blank) does
+            // not leave the renderer looking at coordinates that no longer
+            // exist. `pushViewportToNative` fires inside `resetViewport`.
+            resetViewport()
             onAdapterInfoRefresh()
         }
     }
@@ -346,6 +406,19 @@ class SimViewModel : ViewModel() {
         CoulombNative.nativeSimSetParam(handle, key, value)
     }
 
+    /**
+     * Push the current viewport to the native renderer. Called after
+     * `nativeSimBindSurface` (via [onAdapterInfoRefresh] from the physics
+     * surface), after a reset or preset reload, and whenever the user
+     * mutates the viewport through [applyViewGesture] / [setViewport] /
+     * [resetViewport].
+     */
+    fun pushViewportToNative() {
+        if (handle == 0L) return
+        val v = _viewport.value
+        CoulombNative.nativeSimSetViewport(handle, v.x, v.y, v.w, v.h)
+    }
+
     fun setParam(key: String, value: Double) {
         // M3a exposes only temperature as live-mutable; the drawer surfaces
         // are still visible so the layout can be judged, but nativeSetParam
@@ -383,11 +456,30 @@ data class ThermalReading(
     val timestampNs: Long,
 )
 
-data class ViewportGesture(
-    val panX: Float = 0f,
-    val panY: Float = 0f,
-    val zoom: Float = 1f,
-)
+/**
+ * View-mode viewport in lattice cells. The renderer draws the `(x, y, w, h)`
+ * sub-rectangle of the lattice into its on-screen letterbox rect; a zero or
+ * negative `w`/`h` means "render the whole lattice" (the default). A
+ * non-trivial viewport is the result of pinch-zoom or two-finger pan while
+ * in View mode.
+ */
+data class Viewport(
+    val x: Double = 0.0,
+    val y: Double = 0.0,
+    val w: Double = 0.0,
+    val h: Double = 0.0,
+) {
+    fun isFull(): Boolean = w <= 0.0 || h <= 0.0
+
+    /**
+     * Return a viewport whose `w`/`h` are non-zero. A full-lattice viewport
+     * widens to `(0, 0, lattice, lattice)` so gesture math can treat the
+     * zoomed and un-zoomed cases uniformly without a nullable branch at
+     * every multiply.
+     */
+    fun ensureSized(lattice: Double): Viewport =
+        if (isFull()) Viewport(0.0, 0.0, lattice, lattice) else this
+}
 
 enum class Mode { Paint, Heat, View }
 

@@ -40,6 +40,15 @@ object CoulombNative {
     external fun nativeSimUnbindSurface(handle: Long)
     external fun nativeSimSurfaceResize(handle: Long, w: Long, h: Long)
     external fun nativeSimRenderFrame(handle: Long)
+
+    /**
+     * Set the view-mode viewport in lattice cells. The renderer draws the
+     * requested sub-rect of the lattice into its on-screen letterbox rect;
+     * (0.0, 0.0, 0.0, 0.0) means "render the whole lattice". Values are
+     * clamped against the current lattice on the Rust side so a stale rect
+     * never samples out of bounds.
+     */
+    external fun nativeSimSetViewport(handle: Long, x: Double, y: Double, w: Double, h: Double)
     /**
      * A JSON payload with adapter identity - name, backend, driver,
      * device_type - so the diagnostic overlay can show what wgpu picked
