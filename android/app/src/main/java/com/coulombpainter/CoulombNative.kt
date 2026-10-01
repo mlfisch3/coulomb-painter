@@ -65,6 +65,26 @@ object CoulombNative {
     external fun nativeSimStep(handle: Long): Long
     external fun nativeSimFrameTextureHandle(handle: Long): Long
 
+    // ---- backend selection (M3c GPU wire-up) ----
+    /**
+     * Choose the physics engine. See [Backend] for the enum values.
+     * Returns the backend actually in use after the call: a requested GPU
+     * switch that fails adapter negotiation returns [Backend.Cpu] and the
+     * reason is retrievable via [nativeSimBackendFallbackMessage] - the UI
+     * reads that once and shows a snackbar.
+     */
+    external fun nativeSimSetBackend(handle: Long, backendId: Int): Int
+
+    /** Report the backend currently running `nativeSimTick`. */
+    external fun nativeSimGetBackend(handle: Long): Int
+
+    /**
+     * One-shot read of the last GPU fallback reason. Returns an empty
+     * string when there is nothing pending (first call after a successful
+     * switch, or after the previous read cleared it).
+     */
+    external fun nativeSimBackendFallbackMessage(handle: Long): String?
+
     // ---- surface (M3b) ----
     /**
      * Bind an AndroidExternalSurface's Surface to this sim's wgpu renderer.
@@ -154,6 +174,20 @@ object CoulombNative {
      * here so the field-index-to-name mapping is in exactly one place; a Rust
      * reorder shows up as a wrong field value in the UI on first read.
      */
+    /**
+     * Mirrors `enum Backend` in `rust/coulomb-jni/src/lib.rs`. The IDs must
+     * stay in lock-step: the native side casts the i32 directly, so a reorder
+     * on either side silently flips the engine selected.
+     */
+    enum class Backend(val id: Int) {
+        Cpu(0),
+        Gpu(1);
+
+        companion object {
+            fun fromId(id: Int): Backend = entries.firstOrNull { it.id == id } ?: Cpu
+        }
+    }
+
     data class Stats(
         val iteration: Long,
         val particles: Long,

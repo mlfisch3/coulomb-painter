@@ -46,6 +46,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.coulombpainter.CoulombNative
 import com.coulombpainter.ParamsSnapshot
 import com.coulombpainter.ui.theme.CpAccent
 import com.coulombpainter.ui.theme.CpDim
@@ -81,6 +82,9 @@ fun ParametersDrawer(
     onClearPaint: () -> Unit = {},
     onReseedGas: () -> Unit = {},
     onClose: () -> Unit = {},
+    backendSelected: CoulombNative.Backend = CoulombNative.Backend.Cpu,
+    backendActive: CoulombNative.Backend = CoulombNative.Backend.Cpu,
+    onBackendChange: (CoulombNative.Backend) -> Unit = {},
 ) {
     ModalDrawerSheet(
         drawerContainerColor = CpPanel,
@@ -407,10 +411,30 @@ fun ParametersDrawer(
                     onHelp = { onHelp("compute.step_size") },
                     onCommit = onParamChange,
                 )
-                // Compute still runs on the CPU; the GPU backend selector is
-                // owned by the painter-gpu-compute-wiring follow-up.
-                ParamRow("gpu backend", "CPU",
-                    onHelp = { onHelp("compute.backend") }, comingSoon = true)
+                // M3c: live picker between the CPU reference engine and the
+                // wgpu Metropolis compute kernel. The displayed value shows
+                // what the native side is actually running - a `(fallback)`
+                // suffix appears when the user asked for GPU but adapter
+                // negotiation refused on this device. Tap cycles through
+                // the two options so the drawer stays one row rather than
+                // adding a sub-sheet.
+                val backendLabel = when (backendActive) {
+                    CoulombNative.Backend.Gpu -> "wgpu (compute)"
+                    CoulombNative.Backend.Cpu ->
+                        if (backendSelected == CoulombNative.Backend.Gpu) "cpu (fallback)" else "cpu"
+                }
+                ParamRow(
+                    key = "physics engine",
+                    value = backendLabel,
+                    onHelp = { onHelp("compute.backend") },
+                    onClickValue = {
+                        val next = when (backendSelected) {
+                            CoulombNative.Backend.Cpu -> CoulombNative.Backend.Gpu
+                            CoulombNative.Backend.Gpu -> CoulombNative.Backend.Cpu
+                        }
+                        onBackendChange(next)
+                    },
+                )
                 ParamRow(
                     key = "show diagnostics",
                     value = if (showDiagnostics) "on" else "off",

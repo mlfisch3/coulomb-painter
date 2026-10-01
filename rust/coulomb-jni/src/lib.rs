@@ -25,11 +25,99 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use coulomb_core::{Brush, BrushTarget, CoolingSchedule, Params, Sim};
+use coulomb_gpu::GpuSim;
 use jni::objects::{JByteArray, JClass, JDoubleArray, JObject, JString};
 use jni::sys::{jboolean, jdouble, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 
 use crate::renderer::Renderer;
+
+// ---------------------------------------------------------------- backend
+
+/// Which engine runs the Metropolis kernel for `nativeSimTick`.
+///
+/// `Cpu` is the single-threaded reference core (coulomb-core::Sim::step_many),
+/// which is still what runs when the GPU adapter cannot be negotiated on this
+/// specific device. `Gpu` routes through coulomb-gpu's WGSL compute kernel on
+/// the same wgpu backend the on-device renderer uses.
+#[repr(i32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Backend {
+    Cpu = 0,
+    Gpu = 1,
+}
+
+impl Backend {
+    fn from_i32(v: i32) -> Backend {
+        match v {
+            1 => Backend::Gpu,
+            _ => Backend::Cpu,
+        }
+    }
+    fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
+/// Default engine on fresh handles. Starting on CPU keeps the first few
+/// frames identical to pre-M3c behaviour; the Kotlin side flips to GPU via
+/// `nativeSimSetBackend` once the view model picks the backend to use.
+const DEFAULT_BACKEND: Backend = Backend::Cpu;
+
+/// GPU-side state kept alongside the CPU `Sim`. The CPU sim is still the
+/// authoritative container for `u_edge`, `blocked`, paint strokes, and the
+/// undo stack; the GPU engine only owns a cached copy of occupancy during a
+/// run of sweeps. See `nativeSimTick` for the sync-back dance when the user
+/// switches backends or paints a new stroke.
+struct BackendState {
+    /// What the Kotlin UI last asked for. `selected == Gpu` with
+    /// `active == Cpu` means adapter negotiation failed on this device and
+    /// the picker should show the fallback.
+    selected: Backend,
+    active: Backend,
+    gpu: Option<GpuSim>,
+    /// GpuSim's cached state (occupancy, u_edge upload) is stale relative to
+    /// the CPU `Sim`. Next GPU tick must rebuild from the CPU snapshot
+    /// before dispatching sweeps. Triggered by paint end, preset load, and
+    /// rebuild-key param changes.
+    dirty: bool,
+    /// Reason the last GPU init failed, so Kotlin can show a toast exactly
+    /// once per failed transition and the user knows why the picker refused
+    /// their choice. Cleared when the user explicitly switches away from GPU.
+    fallback_reason: Option<String>,
+    /// Cached occupancy pulled back from the GPU after the last tick, so the
+    /// renderer shows the GPU's live state rather than the pre-tick snapshot
+    /// that still lives in the CPU `Sim`. Also used on backend switch to
+    /// push state back into the CPU sim via `replace_occupancy`.
+    gpu_occ: Option<Vec<bool>>,
+    /// Snapshot of GpuSim's counters at the moment of the last stats read, so
+    /// `nativeSimStats` can surface iteration / acceptance / energy that
+    /// match what the artist is seeing. Updated at the end of every GPU
+    /// tick; reset at (re)build time.
+    gpu_iteration: u64,
+    gpu_proposed: u64,
+    gpu_accepted: u64,
+    gpu_energy: f64,
+    gpu_particles: usize,
+}
+
+impl BackendState {
+    fn new() -> Self {
+        Self {
+            selected: DEFAULT_BACKEND,
+            active: DEFAULT_BACKEND,
+            gpu: None,
+            dirty: true,
+            fallback_reason: None,
+            gpu_occ: None,
+            gpu_iteration: 0,
+            gpu_proposed: 0,
+            gpu_accepted: 0,
+            gpu_energy: 0.0,
+            gpu_particles: 0,
+        }
+    }
+}
 
 // The mutex is here because the Kotlin caller runs one background loop for
 // the physics tick and a separate UI thread for stats reads; a single lock
@@ -63,6 +151,12 @@ struct SimHandle {
     // u32 to the render pass. Held inside the handle so a 512x512 sim does
     // not reallocate 1 MiB per frame.
     occ_scratch: Mutex<Vec<u32>>,
+
+    // GPU backend state. See `BackendState` for the sync-back contract; the
+    // enclosing mutex guards both the GpuSim and its scratch counters so a
+    // concurrent `nativeSimStats` from the UI thread cannot read a torn
+    // snapshot between a sweep and its counter copy-back.
+    backend: Mutex<BackendState>,
 }
 
 struct Telemetry {
@@ -108,6 +202,7 @@ impl SimHandle {
             stroke: Mutex::new(None),
             renderer: Mutex::new(None),
             occ_scratch: Mutex::new(Vec::new()),
+            backend: Mutex::new(BackendState::new()),
         })
     }
 }
@@ -236,6 +331,14 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimResume(
 /// run (0 if paused, or the sim is missing). Rate telemetry is computed here
 /// so `nativeSimStats` can surface a live moves-per-second number without a
 /// second Kotlin-side timer.
+///
+/// `backend == Gpu` routes the step through coulomb-gpu's WGSL compute
+/// kernel. A GpuSim is built lazily from the CPU `Sim`'s current occupancy,
+/// blocked mask, and `u_edge` field - after the dispatch the GPU-side
+/// occupancy is cached in `BackendState` for the renderer and pushed back
+/// into the CPU `Sim` only when the backend switches, so the per-tick cost
+/// stays at one swap of a `Vec<bool>` into the handle rather than a
+/// `replace_occupancy` recompute every frame.
 #[no_mangle]
 pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimTick(
     _env: JNIEnv,
@@ -255,29 +358,241 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimTick(
         if iters == 0 {
             return 0;
         }
-        let started = Instant::now();
-        let iter_before = {
-            let mut sim = h.sim.lock().unwrap();
-            let before = sim.stats().iteration;
-            sim.step_many(iters);
-            before
-        };
-        let iter_after = h.sim.lock().unwrap().stats().iteration;
-        let dt = started.elapsed().as_secs_f64();
-        let done = iter_after - iter_before;
-
-        let mut telem = h.telem.lock().unwrap();
-        telem.last_tick_wall = Some(started);
-        telem.last_tick_iterations = done;
-        if dt > 0.0 {
-            // Metropolis batch size matters for a comparable rate, so the
-            // reported number is proposals-per-second, i.e. iters * batch.
-            // The current live_batch is not exposed on Sim, so we approximate
-            // with the params batch; the desktop reference does the same.
-            let batch = h.sim.lock().unwrap().params().batch as f64;
-            telem.last_mps = (done as f64) * batch / dt;
+        let mut backend_state = h.backend.lock().unwrap();
+        if backend_state.active == Backend::Gpu {
+            tick_gpu(h, &mut backend_state, iters)
+        } else {
+            drop(backend_state);
+            tick_cpu(h, iters)
         }
-        done as jlong
+    })
+}
+
+fn tick_cpu(h: &SimHandle, iters: u64) -> jlong {
+    let started = Instant::now();
+    let iter_before = {
+        let mut sim = h.sim.lock().unwrap();
+        let before = sim.stats().iteration;
+        sim.step_many(iters);
+        before
+    };
+    let iter_after = h.sim.lock().unwrap().stats().iteration;
+    let dt = started.elapsed().as_secs_f64();
+    let done = iter_after - iter_before;
+
+    let mut telem = h.telem.lock().unwrap();
+    telem.last_tick_wall = Some(started);
+    telem.last_tick_iterations = done;
+    if dt > 0.0 {
+        // Metropolis batch size matters for a comparable rate, so the
+        // reported number is proposals-per-second, i.e. iters * batch.
+        // The current live_batch is not exposed on Sim, so we approximate
+        // with the params batch; the desktop reference does the same.
+        let batch = h.sim.lock().unwrap().params().batch as f64;
+        telem.last_mps = (done as f64) * batch / dt;
+    }
+    done as jlong
+}
+
+fn tick_gpu(h: &SimHandle, backend_state: &mut BackendState, iters: u64) -> jlong {
+    if backend_state.gpu.is_none() || backend_state.dirty {
+        // Build or rebuild GpuSim from the current CPU `Sim` snapshot. A paint
+        // stroke or a rebuild-key change on the CPU side flipped `dirty`;
+        // uploading the whole occupancy + u_edge from the CPU is cheaper than
+        // porting the FFT edge rebuild to the GPU (see coulomb-gpu/README.md
+        // "u_edge upload contract").
+        let (params, occ, blocked, u_edge_f32) = {
+            let sim = h.sim.lock().unwrap();
+            let params = sim.params().clone();
+            let occ = sim.occupancy().to_vec();
+            let blocked = sim.blocked().to_vec();
+            let u_edge: Vec<f32> = sim.u_edge().iter().map(|&v| v as f32).collect();
+            (params, occ, blocked, u_edge)
+        };
+        match GpuSim::from_state(params, occ, blocked, u_edge_f32) {
+            Ok(g) => {
+                backend_state.gpu = Some(g);
+                backend_state.dirty = false;
+                backend_state.gpu_iteration = 0;
+                backend_state.gpu_proposed = 0;
+                backend_state.gpu_accepted = 0;
+                backend_state.fallback_reason = None;
+            }
+            Err(e) => {
+                // One failed init is enough: switch active to CPU so the
+                // next tick runs on the fallback and the UI gets a chance
+                // to show the toast. The user can still toggle back to GPU
+                // in the drawer to retry.
+                backend_state.gpu = None;
+                backend_state.active = Backend::Cpu;
+                backend_state.fallback_reason = Some(format!("{e}"));
+                return tick_cpu(h, iters);
+            }
+        }
+    }
+
+    let started = Instant::now();
+    let target_attempts = iters
+        .saturating_mul(h.sim.lock().unwrap().params().batch as u64)
+        .max(1);
+
+    let gpu = backend_state.gpu.as_mut().expect("gpu built above");
+    // Push the live temperature from the CPU-side Params into the GPU engine
+    // so a slider change takes effect on the next sweep without a full
+    // rebuild. Other live params that only touch the pair potential
+    // (strength / cutoff / screening / attract_*) force a rebuild via
+    // `dirty`, so they're handled above.
+    gpu.set_temperature(h.sim.lock().unwrap().params().temperature);
+    let attempted = gpu.step(target_attempts);
+    let gpu_stats = gpu.stats();
+    let gpu_occ = gpu.occupancy();
+    let dt = started.elapsed().as_secs_f64();
+
+    backend_state.gpu_iteration = gpu_stats.iteration;
+    backend_state.gpu_proposed = gpu_stats.proposed;
+    backend_state.gpu_accepted = gpu_stats.accepted;
+    backend_state.gpu_energy = gpu_stats.energy;
+    backend_state.gpu_particles = gpu_stats.particles;
+    backend_state.gpu_occ = Some(gpu_occ);
+
+    let mut telem = h.telem.lock().unwrap();
+    telem.last_tick_wall = Some(started);
+    telem.last_tick_iterations = attempted;
+    if dt > 0.0 {
+        telem.last_mps = attempted as f64 / dt;
+    }
+    iters as jlong
+}
+
+// ---------------------------------------------------------------- backend
+//
+// `nativeSimSetBackend` is the primary knob: Kotlin passes `0` for CPU, `1`
+// for GPU, and reads back the backend that is *actually* active after the
+// call (CPU if GPU adapter negotiation failed). `nativeSimGetBackend` is the
+// mirror used after a lifecycle event (process recreate, drawer open) to
+// repaint the picker from the native source of truth.
+
+/// Switch the physics backend. Returns the backend actually in use after the
+/// call, as an `i32` matching the `Backend` enum (0=CPU, 1=GPU). A requested
+/// GPU switch that fails adapter negotiation falls back to CPU and returns 0,
+/// and `nativeSimBackendFallbackMessage` carries the one-time toast text.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetBackend(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    backend_id: jint,
+) -> jint {
+    guard(Backend::Cpu.as_i32(), || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return Backend::Cpu.as_i32();
+        };
+        let want = Backend::from_i32(backend_id as i32);
+        let mut backend_state = h.backend.lock().unwrap();
+        if backend_state.selected == want && backend_state.active == want {
+            return backend_state.active.as_i32();
+        }
+
+        match want {
+            Backend::Cpu => {
+                // On a GPU->CPU switch, push the GPU's latest occupancy back
+                // into the CPU `Sim` so the artist's painting progress does
+                // not snap back to the pre-GPU snapshot. `replace_occupancy`
+                // scrubs blocked overlaps and rebuilds `pos` + `energy`.
+                if let Some(gpu_occ) = backend_state.gpu_occ.take() {
+                    let mut sim = h.sim.lock().unwrap();
+                    if gpu_occ.len() == sim.params().h * sim.params().w {
+                        sim.replace_occupancy(gpu_occ);
+                    }
+                }
+                backend_state.selected = Backend::Cpu;
+                backend_state.active = Backend::Cpu;
+                backend_state.gpu = None;
+                backend_state.dirty = false;
+                backend_state.fallback_reason = None;
+            }
+            Backend::Gpu => {
+                // Eager init so the picker gets a true/false immediately,
+                // rather than the first tick having to show the fallback a
+                // few hundred ms later. The actual GPU-side buffer build
+                // still happens on the next tick's `tick_gpu` to keep the
+                // branches in one place.
+                backend_state.selected = Backend::Gpu;
+                backend_state.dirty = true;
+                let (params, occ, blocked, u_edge_f32) = {
+                    let sim = h.sim.lock().unwrap();
+                    (
+                        sim.params().clone(),
+                        sim.occupancy().to_vec(),
+                        sim.blocked().to_vec(),
+                        sim.u_edge().iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+                    )
+                };
+                match GpuSim::from_state(params, occ, blocked, u_edge_f32) {
+                    Ok(g) => {
+                        backend_state.gpu = Some(g);
+                        backend_state.dirty = false;
+                        backend_state.active = Backend::Gpu;
+                        backend_state.fallback_reason = None;
+                        backend_state.gpu_iteration = 0;
+                        backend_state.gpu_proposed = 0;
+                        backend_state.gpu_accepted = 0;
+                    }
+                    Err(e) => {
+                        backend_state.gpu = None;
+                        backend_state.active = Backend::Cpu;
+                        backend_state.fallback_reason = Some(format!("{e}"));
+                    }
+                }
+            }
+        }
+        backend_state.active.as_i32()
+    })
+}
+
+/// Report the backend actually in use. 0 for CPU, 1 for GPU.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimGetBackend(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jint {
+    guard(Backend::Cpu.as_i32(), || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return Backend::Cpu.as_i32();
+        };
+        h.backend.lock().unwrap().active.as_i32()
+    })
+}
+
+/// If the last GPU attempt fell back to CPU, return the adapter / device
+/// error string so Kotlin can show it once as a snackbar. Returns an empty
+/// string when there is no pending fallback message. The call clears the
+/// message so a second poll returns empty: callers show it exactly once.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimBackendFallbackMessage<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass<'a>,
+    ptr: jlong,
+) -> jni::sys::jstring {
+    guard(std::ptr::null_mut(), || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return std::ptr::null_mut();
+        };
+        let msg = h
+            .backend
+            .lock()
+            .unwrap()
+            .fallback_reason
+            .take()
+            .unwrap_or_default();
+        match env.new_string(&msg) {
+            Ok(js) => js.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
     })
 }
 
@@ -391,9 +706,17 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRenderFram
             return;
         };
         let sim = h.sim.lock().unwrap();
-        let occ = sim.occupancy();
-        let u_edge = sim.u_edge();
         let (w, h_sz) = (sim.params().w as u32, sim.params().h as u32);
+        let u_edge = sim.u_edge().to_vec();
+        let cpu_occ = sim.occupancy().to_vec();
+        drop(sim);
+        // When the GPU engine owns live occupancy, render from that cached
+        // snapshot instead of the pre-tick CPU state. The GPU keeps the
+        // mobile particles arrangement up to date between backend-switch
+        // syncs; `u_edge` stays fixed during GPU sweeps so the CPU-side
+        // paint field is still authoritative for the painted-cell bit.
+        let occ_from_gpu = h.backend.lock().unwrap().gpu_occ.clone();
+        let occ: Vec<bool> = occ_from_gpu.unwrap_or(cpu_occ);
         // Pack occ + painted into one u32 per cell (bit 0 = mobile, bit 1
         // = painted fixed charge). `u_edge != 0` is what the desktop
         // reference uses to distinguish painted cells (see the desktop
@@ -412,9 +735,6 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRenderFram
             if u_edge[i].abs() > 1e-6 { cell |= 2; }
             scratch.push(cell);
         }
-        // Drop the sim lock before touching wgpu so a slow submit does not
-        // block the physics tick thread waiting behind the render.
-        drop(sim);
         renderer.render(&scratch, w, h_sz);
     })
 }
@@ -594,9 +914,19 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimPaintEnd(
         if s.points.is_empty() {
             return;
         }
+        // When the GPU backend was running, its occupancy is the live truth;
+        // push it back into the CPU sim before the paint stroke lands so the
+        // stroke's `paint_stroke` neighbourhood check sees the arrangement
+        // the artist actually drew over, not the pre-GPU snapshot.
+        sync_gpu_occ_back(h);
         let mut sim = h.sim.lock().unwrap();
         let report = sim.paint_stroke(&s.points, &s.brush, true);
         drop(sim);
+        // Paint strokes mutate `u_edge` and `blocked`; the GPU engine was
+        // initialised with the old buffers, so its sweep would use stale
+        // weights. Mark dirty so the next GPU tick re-uploads from the CPU
+        // snapshot.
+        h.backend.lock().unwrap().dirty = true;
         // Any new stroke resets the "energy drop" baseline so the UI shows
         // the settling that follows the paint, not one accumulated since sim
         // creation.
@@ -620,7 +950,10 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimUndo(
         let Some(h) = (unsafe { handle_from(ptr) }) else {
             return JNI_FALSE;
         };
-        if h.sim.lock().unwrap().undo_stroke() {
+        sync_gpu_occ_back(h);
+        let changed = h.sim.lock().unwrap().undo_stroke();
+        if changed {
+            h.backend.lock().unwrap().dirty = true;
             JNI_TRUE
         } else {
             JNI_FALSE
@@ -639,11 +972,14 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimClearPaint
         let Some(h) = (unsafe { handle_from(ptr) }) else {
             return;
         };
+        sync_gpu_occ_back(h);
         // The core does not expose an atomic clear_paint yet; a loop of
         // undo_stroke reaches the same terminal state and is what the desktop
         // reference does too. Bounded by the undo stack cap in coulomb-core.
         let mut sim = h.sim.lock().unwrap();
         while sim.undo_stroke() {}
+        drop(sim);
+        h.backend.lock().unwrap().dirty = true;
     })
 }
 
@@ -715,12 +1051,20 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetParam(
         let Some(h) = (unsafe { handle_from(ptr) }) else {
             return;
         };
-        let key = match env.get_string(&key) {
+        let key: String = match env.get_string(&key) {
             Ok(s) => s.into(),
             Err(_) => return,
         };
+        let dirty_gpu = is_gpu_rebuild_key(&key);
+        if dirty_gpu {
+            sync_gpu_occ_back(h);
+        }
         let mut sim = h.sim.lock().unwrap();
         apply_param(&mut sim, key, value);
+        drop(sim);
+        if dirty_gpu {
+            h.backend.lock().unwrap().dirty = true;
+        }
     })
 }
 
@@ -769,11 +1113,19 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadParams
             Some(o) => o,
             None => return JNI_FALSE,
         };
+        let any_rebuild = obj.keys().any(|k| is_gpu_rebuild_key(k));
+        if any_rebuild {
+            sync_gpu_occ_back(h);
+        }
         let mut sim = h.sim.lock().unwrap();
         for (k, val) in obj {
             if let Some(f) = val.as_f64() {
                 apply_param(&mut sim, k.clone(), f);
             }
+        }
+        drop(sim);
+        if any_rebuild {
+            h.backend.lock().unwrap().dirty = true;
         }
         JNI_TRUE
     })
@@ -870,6 +1222,17 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimLoadPreset
         let mut telem = h.telem.lock().unwrap();
         telem.baseline_energy = energy;
         telem.paint_cells_total = 0;
+        drop(telem);
+        // Fresh Sim means the GPU state is stale by construction - drop the
+        // cached GpuSim and clear the mirrored occupancy so the next GPU
+        // tick rebuilds from the fresh CPU snapshot.
+        let mut backend_state = h.backend.lock().unwrap();
+        backend_state.gpu = None;
+        backend_state.gpu_occ = None;
+        backend_state.dirty = true;
+        backend_state.gpu_iteration = 0;
+        backend_state.gpu_proposed = 0;
+        backend_state.gpu_accepted = 0;
         JNI_TRUE
     })
 }
@@ -1222,25 +1585,50 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimStats<'a>(
         let Some(h) = (unsafe { handle_from(ptr) }) else {
             return std::ptr::null_mut();
         };
-        let stats = h.sim.lock().unwrap().stats();
+        let cpu_stats = h.sim.lock().unwrap().stats();
         let telem = h.telem.lock().unwrap();
-        let (occupancy, energy_drop) = {
-            let sim = h.sim.lock().unwrap();
-            let total = (sim.params().h * sim.params().w) as f64;
-            let occ = if total > 0.0 { stats.particles as f64 / total } else { 0.0 };
-            let drop = telem.baseline_energy - stats.energy;
-            (occ, drop)
-        };
+        let backend_state = h.backend.lock().unwrap();
+        // When GPU owns the live engine, surface its iteration / acceptance /
+        // energy / particle count. Temperature comes from CPU-side Params
+        // because that's where the UI slider writes. Batch is the GPU's
+        // reported sweep width (tile edge), so the "batch" column still has
+        // a meaningful number rather than a stale CPU batch.
+        let (iteration, particles, energy, acceptance, batch) =
+            if backend_state.active == Backend::Gpu && backend_state.gpu.is_some() {
+                let acc = if backend_state.gpu_proposed > 0 {
+                    backend_state.gpu_accepted as f64 / backend_state.gpu_proposed as f64
+                } else {
+                    0.0
+                };
+                (
+                    backend_state.gpu_iteration as f64,
+                    backend_state.gpu_particles as f64,
+                    backend_state.gpu_energy,
+                    acc,
+                    cpu_stats.batch as f64,
+                )
+            } else {
+                (
+                    cpu_stats.iteration as f64,
+                    cpu_stats.particles as f64,
+                    cpu_stats.energy,
+                    cpu_stats.acceptance(),
+                    cpu_stats.batch as f64,
+                )
+            };
+        let total = (h.sim.lock().unwrap().params().h * h.sim.lock().unwrap().params().w) as f64;
+        let occupancy = if total > 0.0 { particles / total } else { 0.0 };
+        let energy_drop = telem.baseline_energy - energy;
         let vals: [f64; 10] = [
-            stats.iteration as f64,
-            stats.particles as f64,
-            stats.temperature,
-            stats.energy,
-            stats.acceptance(),
+            iteration,
+            particles,
+            cpu_stats.temperature,
+            energy,
+            acceptance,
             telem.last_mps,
             occupancy,
             energy_drop,
-            stats.batch as f64,
+            batch,
             telem.paint_cells_total as f64,
         ];
         let arr: JDoubleArray = match env.new_double_array(vals.len() as i32) {
@@ -1262,6 +1650,43 @@ fn apply_param(sim: &mut Sim, key: String, value: f64) {
     // silently no-ops here - the drawer sends best-effort JSON, so a stray
     // decorative field must not fail the whole update batch.
     let _ = sim.set_param(&key, value);
+}
+
+/// Keys that force the GPU engine to rebuild from the CPU snapshot before the
+/// next tick. Mirrors coulomb-core's REBUILD_KEYS: anything that reshapes the
+/// pair potential or the periodic boundary changes the offset table and
+/// `u_edge` that the GpuSim was initialised with. `charge` is in here too
+/// because the GPU-side `GpuParams` pins it at construction time, so a slider
+/// change is otherwise silently ignored by the GPU path.
+fn is_gpu_rebuild_key(key: &str) -> bool {
+    matches!(
+        key,
+        "strength"
+            | "screening"
+            | "cutoff"
+            | "periodic"
+            | "attract_depth"
+            | "attract_range"
+            | "charge"
+    )
+}
+
+/// Push the GPU engine's cached occupancy back into the CPU `Sim`, so a
+/// subsequent CPU-only operation (paint stroke, undo, backend switch) acts
+/// on what the artist saw on screen, not the pre-GPU snapshot the CPU sim
+/// has been sitting on while the GPU swept. Cheap when GPU was not active -
+/// the cache is `None` and this returns immediately.
+fn sync_gpu_occ_back(h: &SimHandle) {
+    let occ = {
+        let mut backend_state = h.backend.lock().unwrap();
+        backend_state.gpu_occ.take()
+    };
+    if let Some(occ) = occ {
+        let mut sim = h.sim.lock().unwrap();
+        if occ.len() == sim.params().h * sim.params().w {
+            sim.replace_occupancy(occ);
+        }
+    }
 }
 
 fn read_param(sim: &Sim, key: &str) -> f64 {

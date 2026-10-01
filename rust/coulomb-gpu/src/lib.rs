@@ -332,7 +332,12 @@ impl GpuSim {
         Self::from_state(params, occ, blocked, u_edge)
     }
 
-    fn from_state(
+    /// Build a GpuSim from an already-prepared CPU-side state: occupancy,
+    /// blocked mask, and precomputed `u_edge` (as f32 for GPU upload).
+    /// This is the hook `coulomb-jni` uses to snapshot the running CPU `Sim`
+    /// after a paint stroke or param rebuild and hand it to the GPU engine
+    /// without recomputing the FFT-driven edge field again.
+    pub fn from_state(
         params: Params,
         occ: Vec<bool>,
         blocked: Vec<bool>,
