@@ -15,9 +15,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.GridOn
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Reorder
@@ -72,6 +75,9 @@ fun ParametersDrawer(
     onLoadWireMesh: () -> Unit = {},
     onLoadStripes: () -> Unit = {},
     onLoadDisc: () -> Unit = {},
+    onSnapshot: () -> Unit = {},
+    onUndoStroke: () -> Unit = {},
+    onClearPaint: () -> Unit = {},
     onClose: () -> Unit = {},
 ) {
     ModalDrawerSheet(
@@ -162,6 +168,30 @@ fun ParametersDrawer(
                 iconDescription = "Load disc test pattern",
                 label = "Load disc test pattern",
                 onClick = onLoadDisc,
+            )
+            // Captain parity gap H6/H7: Undo, Clear paint, Snapshot. Each
+            // icon is used only here per captain "no icon may mean two things"
+            // rule (Undo mirror handles RTL layouts; Delete is distinct from
+            // Refresh's reset-canvas; PhotoCamera is distinct from any
+            // existing icon). Clear paint is destructive and goes through a
+            // confirmation dialog at the caller.
+            MenuRow(
+                icon = Icons.AutoMirrored.Filled.Undo,
+                iconDescription = "Undo stroke",
+                label = "Undo stroke",
+                onClick = onUndoStroke,
+            )
+            MenuRow(
+                icon = Icons.Filled.Delete,
+                iconDescription = "Clear paint (destructive)",
+                label = "Clear paint",
+                onClick = onClearPaint,
+            )
+            MenuRow(
+                icon = Icons.Filled.PhotoCamera,
+                iconDescription = "Snapshot PNG",
+                label = "Snapshot PNG",
+                onClick = onSnapshot,
             )
             Box(
                 modifier = Modifier

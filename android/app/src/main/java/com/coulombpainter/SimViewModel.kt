@@ -293,6 +293,145 @@ class SimViewModel : ViewModel() {
     }
 
     /**
+     * Pop the most recent stroke. The physics state the gas settled into
+     * between paint and undo stays - only the stroke's charge and painted-
+     * block flags are reverted, matching the desktop `undo_stroke` contract.
+     */
+    fun undo() {
+        if (handle == 0L) return
+        viewModelScope.launch(Dispatchers.Default) {
+            CoulombNative.nativeSimUndo(handle)
+        }
+    }
+
+    /**
+     * Captain-level destructive op: discard every painted stroke. Loops
+     * `undo_stroke` on the native side; the caller is responsible for
+     * confirming via a dialog per captain destructive-action rule.
+     */
+    fun clearPaint() {
+        if (handle == 0L) return
+        viewModelScope.launch(Dispatchers.Default) {
+            CoulombNative.nativeSimClearPaint(handle)
+        }
+    }
+
+    /**
+     * Advance one iteration while the sim is otherwise paused. Pairs with
+     * the Freeze/Resume toggle in the top bar: the artist freezes to paint
+     * without physics advancing, then steps the annealer one iteration at a
+     * time to watch the response.
+     */
+    fun step() {
+        if (handle == 0L) return
+        viewModelScope.launch(Dispatchers.Default) {
+            CoulombNative.nativeSimStep(handle)
+        }
+    }
+
+    /**
+     * Encode the current sim as a PNG byte array. Null on failure (no handle,
+     * encoder error). The caller writes it through SAF; nothing on the Rust
+     * side touches the filesystem.
+     */
+    suspend fun snapshotPng(): ByteArray? {
+        if (handle == 0L) return null
+        return withContext(Dispatchers.Default) {
+            CoulombNative.nativeSimSnapshotPng(handle)
+        }
+    }
+
+    /**
+     * Rebuild the canvas from captain-chosen geometry and charge sign. Used by
+     * the New Canvas dialog's Create button. Params (brush, temperature, …)
+     * carry across because the native call keeps the current `Params` fields
+     * other than the ones named here; the Kotlin mirror is kept in sync
+     * through `pushParamsToNative`.
+     */
+    fun recreate(h: Int, w: Int, seed: Long, nParticles: Int, chargeSign: Int) {
+        if (handle == 0L) return
+        viewModelScope.launch(Dispatchers.Default) {
+            val ok = CoulombNative.nativeSimRecreate(
+                handle,
+                h.toLong(),
+                w.toLong(),
+                seed,
+                nParticles.toLong(),
+                chargeSign,
+            )
+            if (ok) {
+                _lattice.value = maxOf(h, w)
+                // Mirror the native-side charge sign flip into the Kotlin
+                // ParamsSnapshot BEFORE pushParamsToNative, otherwise the
+                // immediate push would overwrite the sign we just set.
+                applyChargeSignToSnapshot(chargeSign)
+                pushBrushToNative()
+                pushParamsToNative()
+                // The lattice shape just changed, so a view-mode viewport
+                // from before the recreate would address cells that no
+                // longer exist. Reset so the next render shows the whole
+                // new lattice; the artist can zoom back in from there.
+                resetViewport()
+                onAdapterInfoRefresh()
+            }
+        }
+    }
+
+    /**
+     * Rebuild the canvas from a user-uploaded grayscale coverage image. `cov`
+     * is `h * w` bytes, 0..=255. The caller is responsible for decoding the
+     * picked bitmap and down/up-sampling to the target lattice.
+     */
+    fun rebuildWithCoverage(
+        h: Int,
+        w: Int,
+        seed: Long,
+        nParticles: Int,
+        chargeSign: Int,
+        cov: ByteArray,
+    ) {
+        if (handle == 0L) return
+        viewModelScope.launch(Dispatchers.Default) {
+            val ok = CoulombNative.nativeSimRebuildWithCoverage(
+                handle,
+                h.toLong(),
+                w.toLong(),
+                seed,
+                nParticles.toLong(),
+                chargeSign,
+                cov,
+            )
+            if (ok) {
+                _lattice.value = maxOf(h, w)
+                applyChargeSignToSnapshot(chargeSign)
+                pushBrushToNative()
+                pushParamsToNative()
+                resetViewport()
+                onAdapterInfoRefresh()
+            }
+        }
+    }
+
+    /**
+     * Mirror the native-side `apply_charge_sign` into the Kotlin
+     * `ParamsSnapshot` so the drawer's charge-per-particle row and the next
+     * `pushParamsToNative` agree with the sim's actual sign. `0` keeps the
+     * current sign to match the Rust-side default.
+     */
+    private fun applyChargeSignToSnapshot(sign: Int) {
+        val cur = _params.value.charge
+        val mag = kotlin.math.abs(cur)
+        val next = when {
+            sign > 0 -> mag
+            sign < 0 -> -mag
+            else -> cur
+        }
+        if (next != cur) {
+            _params.value = _params.value.setByName("charge", next)
+        }
+    }
+
+    /**
      * Reset the sim to a fresh blank at the current params. The
      * `nativeSimLoadPreset("blank")` path in `coulomb-jni` rebuilds a
      * Sim with the current Params via `Sim::new_blank`, which is what

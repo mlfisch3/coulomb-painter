@@ -25,9 +25,44 @@ object CoulombNative {
     external fun nativeSimDestroy(handle: Long)
     external fun nativeSimPause(handle: Long)
     external fun nativeSimResume(handle: Long)
+    /**
+     * Replace the sim in place with a fresh blank canvas at the given lattice
+     * geometry, particle count, and charge sign. The renderer slot stays
+     * bound; the next render frame reads the new sim state. See the Rust
+     * `nativeSimRecreate` doc comment for the `chargeSign` encoding (+1
+     * positive, -1 negative, 0 keep previous).
+     */
+    external fun nativeSimRecreate(
+        handle: Long,
+        h: Long,
+        w: Long,
+        seed: Long,
+        nParticles: Long,
+        chargeSign: Int,
+    ): Boolean
+    /**
+     * Replace the sim in place with a canvas built from a grayscale coverage
+     * image. `cov` is `h * w` bytes, each 0..=255: 0 = clear, 255 = full line
+     * charge. Decoded on the Kotlin side via `Bitmap.getPixel` + luminance so
+     * the Rust side stays image-codec-free.
+     */
+    external fun nativeSimRebuildWithCoverage(
+        handle: Long,
+        h: Long,
+        w: Long,
+        seed: Long,
+        nParticles: Long,
+        chargeSign: Int,
+        cov: ByteArray,
+    ): Boolean
 
     // ---- frame ----
     external fun nativeSimTick(handle: Long, iterations: Long): Long
+    /**
+     * Advance the sim by exactly one iteration, regardless of pause state.
+     * Used by the top-bar Step button paired with Freeze.
+     */
+    external fun nativeSimStep(handle: Long): Long
     external fun nativeSimFrameTextureHandle(handle: Long): Long
 
     // ---- surface (M3b) ----

@@ -1331,6 +1331,21 @@ impl Sim {
     pub fn blocked(&self) -> &[bool] {
         &self.blocked
     }
+
+    /// Painted-charge accumulator in lattice-cell order. Written by
+    /// `paint_stroke`, zeroed on `undo_stroke` for touched cells. Snapshot
+    /// encoders read this directly rather than reconstructing from `u_edge`,
+    /// which carries the convolution halo too.
+    pub fn paint(&self) -> &[f64] {
+        &self.paint
+    }
+
+    /// Line-charge coverage in 0..=1 per cell. Set at construction time; the
+    /// snapshot encoder reads it so an uploaded image's lines show through
+    /// behind the mobile gas.
+    pub fn cov(&self) -> &[f64] {
+        &self.cov
+    }
 }
 
 #[derive(Debug, Clone, Default)]
