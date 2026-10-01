@@ -93,6 +93,27 @@ class SimViewModel : ViewModel() {
 
     private var persistenceJob: Job? = null
 
+    // M3c: GPU vs CPU backend selection.
+    //
+    // `selected` is the user's pick in the drawer; `active` is what the native
+    // side is actually running (CPU if GPU adapter negotiation failed on this
+    // device). On a fallback, `fallbackMessage` holds the one-time snackbar
+    // string. The drawer picker reads `selected`, the diagnostics line reads
+    // `active`; a disagreement is the signal that the fallback kicked in.
+    //
+    // Default is CPU so a fresh install never risks a startup stall on a
+    // device whose wgpu adapter negotiation turns out to be slow or broken;
+    // the user flips to GPU from the drawer picker, and the snackbar reports
+    // the result either way.
+    private val _backendSelected = MutableStateFlow(CoulombNative.Backend.Cpu)
+    val backendSelected: StateFlow<CoulombNative.Backend> = _backendSelected.asStateFlow()
+
+    private val _backendActive = MutableStateFlow(CoulombNative.Backend.Cpu)
+    val backendActive: StateFlow<CoulombNative.Backend> = _backendActive.asStateFlow()
+
+    private val _fallbackMessage = MutableStateFlow<String?>(null)
+    val fallbackMessage: StateFlow<String?> = _fallbackMessage.asStateFlow()
+
     /**
      * Hydrate the Kotlin-side state from a previously saved snapshot. Must be
      * called before [ensureCreated] so the first `pushBrushToNative` and
@@ -165,6 +186,9 @@ class SimViewModel : ViewModel() {
         // _running.value, but keeping native in sync matches the pause/resume
         // button contract.
         if (!_running.value) CoulombNative.nativeSimPause(handle)
+        // Backend starts as CPU (same engine M3b shipped); the drawer picker
+        // flips to GPU on demand so a slow adapter negotiation at process
+        // start never stalls the first frame.
         startLoops()
     }
 
@@ -183,6 +207,7 @@ class SimViewModel : ViewModel() {
             }
         }
         statsJob = viewModelScope.launch(Dispatchers.Main) {
+            var tick = 0
             while (true) {
                 if (handle != 0L) {
                     // Native fetch on the default dispatcher so the main
@@ -191,7 +216,25 @@ class SimViewModel : ViewModel() {
                     val next = withContext(Dispatchers.Default) {
                         CoulombNative.Stats.from(CoulombNative.nativeSimStats(handle))
                     }
-                    if (next != null) _stats.value = next
+                    if (next != null) {
+                        _stats.value = next
+                        // Once a second log the active backend + MPS so an
+                        // on-device MPS measurement can read the sustained
+                        // rate from logcat (`-s CoulombPainter`) without
+                        // opening the diagnostics overlay. 1 Hz is quiet
+                        // enough that a tail session stays legible.
+                        if (tick % 5 == 0) {
+                            Log.i(
+                                "CoulombPainter",
+                                "physics backend=${_backendActive.value}" +
+                                    " mps=${"%.0f".format(next.movesPerSecond)}" +
+                                    " iter=${next.iteration}" +
+                                    " particles=${next.particles}" +
+                                    " T=${"%.0f".format(next.temperature)}K",
+                            )
+                        }
+                        tick++
+                    }
                 }
                 delay(200L)
             }
@@ -657,6 +700,42 @@ class SimViewModel : ViewModel() {
         if (handle == 0L) return
         val v = _viewport.value
         CoulombNative.nativeSimSetViewport(handle, v.x, v.y, v.w, v.h)
+    }
+
+    /**
+     * Flip between the CPU reference engine and the wgpu Metropolis kernel.
+     * Updates [backendActive] from the native return value so the UI reflects
+     * what actually runs, not what was requested; a GPU request that falls
+     * back to CPU surfaces via [fallbackMessage] as a one-time snackbar.
+     *
+     * `suppressSnackbarWhenHonoured`: on the automatic bootstrap at
+     * `ensureCreated` time, we only want to surface the toast on a failure,
+     * not every normal launch into GPU mode. Explicit user toggles pass
+     * false so a successful switch is still silent (as expected) but any
+     * failure is loud (as expected).
+     */
+    fun setBackend(backend: CoulombNative.Backend, suppressSnackbarWhenHonoured: Boolean = false) {
+        _backendSelected.value = backend
+        if (handle == 0L) return
+        viewModelScope.launch(Dispatchers.Default) {
+            val gotId = CoulombNative.nativeSimSetBackend(handle, backend.id)
+            val got = CoulombNative.Backend.fromId(gotId)
+            _backendActive.value = got
+            val reason = CoulombNative.nativeSimBackendFallbackMessage(handle).orEmpty()
+            if (got != backend && reason.isNotBlank()) {
+                _fallbackMessage.value = "GPU unavailable: $reason - running on CPU."
+            } else if (!suppressSnackbarWhenHonoured && got != backend) {
+                _fallbackMessage.value = "Switched to ${got.name} (GPU request not honoured)."
+            }
+            // Refresh adapter info so the diagnostic overlay shows the device
+            // the renderer picked, which may be the only clue if GPU compute
+            // succeeded but the renderer differs.
+            onAdapterInfoRefresh()
+        }
+    }
+
+    fun clearFallbackMessage() {
+        _fallbackMessage.value = null
     }
 
     fun setParam(key: String, value: Double) {

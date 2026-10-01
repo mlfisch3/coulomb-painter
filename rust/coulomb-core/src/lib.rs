@@ -1784,6 +1784,34 @@ impl Sim {
     pub fn cov(&self) -> &[f64] {
         &self.cov
     }
+
+    /// Replace the live occupancy from an outside source (M3c's GPU backend
+    /// hands back the lattice it just ran Metropolis on). The length must
+    /// match the current lattice; any landing on a blocked site is scrubbed
+    /// so the invariant `occ[i] && blocked[i]` stays false. `pos`, counters,
+    /// and `energy` are rebuilt from the new occupancy.
+    pub fn replace_occupancy(&mut self, new_occ: Vec<bool>) {
+        assert_eq!(
+            new_occ.len(),
+            self.params.h * self.params.w,
+            "replace_occupancy: lattice size mismatch",
+        );
+        self.occ = new_occ;
+        for i in 0..self.occ.len() {
+            if self.occ[i] && self.blocked[i] {
+                self.occ[i] = false;
+            }
+        }
+        self.pos.clear();
+        for y in 0..self.params.h {
+            for x in 0..self.params.w {
+                if self.occ[y * self.params.w + x] {
+                    self.pos.push((y as i32, x as i32));
+                }
+            }
+        }
+        self.energy = self.total_energy();
+    }
 }
 
 #[derive(Debug, Clone, Default)]

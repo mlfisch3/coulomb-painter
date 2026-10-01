@@ -276,6 +276,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "coulomb-core",
+ "coulomb-gpu",
  "jni",
  "ndk",
  "ndk-sys 0.6.0+11769913",

@@ -5,12 +5,24 @@
 // duration elapses. Reports MPS, render-frames-per-second, adapter identity,
 // and peak GPU buffer allocation, plus a final JSON blob for machine reads.
 
-use coulomb_core::Params;
+use coulomb_core::{Params, Sim};
 use coulomb_gpu::GpuSim;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// Which engine the bench exercises. CPU drives `coulomb-core::Sim::step_many`
+/// in the same shape the Android app's `nativeSimTick` runs it (same batch,
+/// same step_size); GPU goes through `coulomb-gpu::GpuSim::sweep` as before.
+/// Having both numbers from one binary makes the CPU/GPU ratio a single
+/// `--backend cpu|gpu` pair of runs, which the M3c PR body uses to document
+/// the on-AVD speedup from wiring the compute kernel in.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BenchBackend {
+    Cpu,
+    Gpu,
+}
 
 #[derive(Debug, Deserialize)]
 struct Stage {
@@ -78,6 +90,7 @@ fn main() {
     let mut scenario_path: Option<PathBuf> = None;
     let mut duration: Duration = Duration::from_secs(5);
     let mut moves_per_tile: u32 = 64;
+    let mut backend = BenchBackend::Gpu;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -87,6 +100,16 @@ fn main() {
             }
             "--moves-per-tile" => {
                 moves_per_tile = args.next().and_then(|v| v.parse().ok()).unwrap_or(moves_per_tile);
+            }
+            "--backend" => {
+                backend = match args.next().as_deref() {
+                    Some("cpu") => BenchBackend::Cpu,
+                    Some("gpu") | None => BenchBackend::Gpu,
+                    Some(other) => {
+                        eprintln!("--backend expects 'cpu' or 'gpu', got {other:?}");
+                        std::process::exit(2);
+                    }
+                };
             }
             _ => {
                 eprintln!("unknown arg: {}", a);
@@ -126,6 +149,11 @@ fn main() {
         step_size: sc.step_size,
         ..Params::default()
     };
+
+    if backend == BenchBackend::Cpu {
+        run_cpu(sc, params, temperature, duration);
+        return;
+    }
 
     let mut sim = match GpuSim::new_blank(params, sc.particles) {
         Ok(s) => s,
@@ -211,6 +239,68 @@ fn main() {
         "final_energy_ev": e,
         "moves_per_tile": moves_per_tile,
         "tile_edge": sim.tile_edge(),
+    });
+    println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+}
+
+fn run_cpu(sc: Scenario, params: Params, temperature: f64, duration: Duration) {
+    // CPU bench mirrors the Android app's `nativeSimTick` shape: default
+    // batch=64 one Metropolis attempt per sweep, counted as `batch` moves to
+    // keep the proposals-per-second number comparable with the GPU side.
+    // The scenario's batch is overridden here because the json files pin
+    // `batch: 1` for parity-with-GPU purposes; the app runs at batch=64.
+    let mut cpu_params = params;
+    cpu_params.batch = 64;
+    cpu_params.batch_min = 1;
+    cpu_params.batch_decrement = 1;
+    cpu_params.fail_limit = 12;
+    let mut sim = Sim::new_blank(cpu_params.clone(), sc.particles);
+    eprintln!("scenario: {}", sc.name);
+    eprintln!("adapter: coulomb-core::Sim (CPU, single-thread)");
+    eprintln!("temperature: {} K", temperature);
+    eprintln!("batch: {}", cpu_params.batch);
+
+    // Warm-up step so the kernel caches are hot before the measured window.
+    sim.step_many(100);
+    let proposed_before = sim.stats().proposed;
+    let accepted_before = sim.stats().accepted;
+
+    let t0 = Instant::now();
+    let mut attempted: u64 = 0;
+    while t0.elapsed() < duration {
+        // 50-at-a-time mirrors the app's `nativeSimTick(handle, 50L)` call.
+        sim.step_many(50);
+        attempted += 50 * cpu_params.batch as u64;
+    }
+    let elapsed = t0.elapsed();
+    let mps = attempted as f64 / elapsed.as_secs_f64();
+    let proposed_after = sim.stats().proposed;
+    let accepted_after = sim.stats().accepted;
+    let acc_rate = if proposed_after > proposed_before {
+        (accepted_after - accepted_before) as f64 / (proposed_after - proposed_before) as f64
+    } else {
+        0.0
+    };
+    let stats = sim.stats();
+
+    let summary = json!({
+        "scenario": sc.name,
+        "adapter": {
+            "name": "coulomb-core::Sim",
+            "backend": "CPU",
+            "device_type": "Cpu",
+            "driver": "coulomb-core single-threaded reference",
+        },
+        "compute": {
+            "seconds": elapsed.as_secs_f64(),
+            "attempts": attempted,
+            "mps": mps,
+            "accept_rate": acc_rate,
+        },
+        "temperature": temperature,
+        "particles": stats.particles,
+        "final_energy_ev": stats.energy,
+        "batch": cpu_params.batch,
     });
     println!("{}", serde_json::to_string_pretty(&summary).unwrap());
 }

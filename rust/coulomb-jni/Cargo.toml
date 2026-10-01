@@ -14,6 +14,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 coulomb-core = { path = "../coulomb-core" }
+# coulomb-gpu is linked in so `nativeSimTick` can route through the WGSL
+# Metropolis compute kernel on devices where wgpu finds an adapter. The CPU
+# path from coulomb-core stays live as a fallback when adapter negotiation
+# fails on a specific device.
+coulomb-gpu = { path = "../coulomb-gpu" }
 # jni-rs is the standard Rust <-> JNI binding. `no_std` shims and hand-rolled
 # ABIs both trade too much safety for no measurable gain; the mangling matches
 # Android's JNIEnv contract when we use jni-rs's macro-free `pub extern "system"`

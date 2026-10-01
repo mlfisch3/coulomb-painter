@@ -36,6 +36,9 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
@@ -94,6 +97,21 @@ fun CoulombPainterApp(vm: SimViewModel) {
     val lattice by vm.lattice.collectAsState()
     val showDiagnostics by vm.showDiagnostics.collectAsState()
     val drawerIsOpen = drawerState.isOpen || drawerState.targetValue == DrawerValue.Open
+    val backendSelected by vm.backendSelected.collectAsState()
+    val backendActive by vm.backendActive.collectAsState()
+    val fallbackMessage by vm.fallbackMessage.collectAsState()
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    // Surface GPU-fallback events as a snackbar. The VM clears the message
+    // itself after we've shown it; this effect only drives the UI once per
+    // distinct message.
+    androidx.compose.runtime.LaunchedEffect(fallbackMessage) {
+        val msg = fallbackMessage
+        if (!msg.isNullOrBlank()) {
+            snackbarHostState.showSnackbar(message = msg)
+            vm.clearFallbackMessage()
+        }
+    }
 
     // New-canvas dialog state - preserved across the image-picker roundtrip
     // so an uploaded coverage image survives the launcher's own recomposition.
@@ -214,6 +232,9 @@ fun CoulombPainterApp(vm: SimViewModel) {
                 // top-right per captain report and closes the drawer via the
                 // same DrawerState the hamburger opens.
                 onClose = { coroutineScope.launch { drawerState.close() } },
+                backendSelected = backendSelected,
+                backendActive = backendActive,
+                onBackendChange = { vm.setBackend(it) },
             )
         },
     ) {
@@ -276,6 +297,16 @@ fun CoulombPainterApp(vm: SimViewModel) {
 
             if (showDiagnostics) {
                 DiagnosticOverlay(vm = vm, onDismiss = { vm.setShowDiagnostics(false) })
+            }
+
+            // Snackbar sits above the bottom bar so a GPU fallback toast is
+            // visible even while the drawer is open. It is the only Snackbar
+            // in the app at this stage, so no custom tag is needed.
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier.align(Alignment.BottomCenter),
+            ) { data ->
+                Snackbar(snackbarData = data)
             }
         }
     }
