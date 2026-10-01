@@ -405,6 +405,40 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimRenderFram
     })
 }
 
+/// Push a view-mode viewport (origin + size in lattice cells) that the
+/// renderer samples into the on-screen letterbox rect. Pass `(0, 0, 0, 0)`
+/// to clear the viewport and resume rendering the whole lattice. Values
+/// are clamped to the current lattice on each render frame, so a late
+/// update after a lattice shrink does not sample out of bounds. No-op
+/// when no surface is bound - a Kotlin caller that sets the viewport
+/// before `nativeSimBindSurface` is tolerated (the renderer picks up the
+/// stored value on bind) but today's flow always sets after bind.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetViewport(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    x: jdouble,
+    y: jdouble,
+    w: jdouble,
+    h: jdouble,
+) {
+    guard((), || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h_sim) = (unsafe { handle_from(ptr) }) else {
+            return;
+        };
+        let rect = if w > 0.0 && h > 0.0 {
+            Some([x as f32, y as f32, w as f32, h as f32])
+        } else {
+            None
+        };
+        if let Some(r) = h_sim.renderer.lock().unwrap().as_mut() {
+            r.set_src_rect(rect);
+        }
+    })
+}
+
 /// Return a JSON string with the adapter's identity fields so the
 /// diagnostic overlay in Kotlin can show what wgpu picked. Returns "{}"
 /// when no surface is bound. A JSON payload rather than a struct is chosen

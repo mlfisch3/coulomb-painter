@@ -119,23 +119,34 @@ fun CoulombPainterApp(vm: SimViewModel) {
         },
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            PhysicsSurface(
-                vm = vm,
-                lattice = lattice,
-                // Firstmate bug #2: refuse touches when the drawer is open,
-                // so the tap that dismisses the drawer is not also read as
-                // a paint stroke.
-                touchEnabled = !drawerIsOpen,
-                modifier = Modifier.fillMaxSize(),
-            )
-
+            // Column-stack so the SurfaceView only lays out between the top
+            // bar and the stats + bottom bars. The scout's M6 finding was
+            // that the SurfaceView previously fillMaxSize'd under the
+            // chrome, swallowing touches that the chrome composables also
+            // claimed. Keeping the SurfaceView in its own weighted slot
+            // means Compose and the SurfaceView partition the pointer
+            // stream cleanly without an explicit inset pass.
             Column(modifier = Modifier.fillMaxSize()) {
                 TopBar(
                     running = running,
                     onMenu = { coroutineScope.launch { drawerState.open() } },
                     onToggleRun = { vm.setRunning(!running) },
                 )
-                Spacer(Modifier.weight(1f))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                ) {
+                    PhysicsSurface(
+                        vm = vm,
+                        lattice = lattice,
+                        // Firstmate bug #2: refuse touches when the drawer
+                        // is open, so the tap that dismisses the drawer is
+                        // not also read as a paint stroke.
+                        touchEnabled = !drawerIsOpen,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
                 StatsBar(stats = stats)
                 BottomBar(
                     mode = mode,
