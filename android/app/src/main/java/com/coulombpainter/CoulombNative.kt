@@ -103,6 +103,10 @@ object CoulombNative {
      * kernel would fall back to `Brush::default()` (the fat-line default)
      * regardless of what the user set on the slider - the M3b bug the captain
      * called out on the S24.
+     *
+     * `target` is 0 for Fixed, 1 for Mobile. The raw-f64 setter cannot carry
+     * an enum; the integer encoding is also what `nativeSimSetBrush` in Rust
+     * expects.
      */
     external fun nativeSimSetBrush(
         handle: Long,
@@ -113,7 +117,18 @@ object CoulombNative {
         hardness: Double,
         penetrability: Double,
         coupling: Double,
+        target: Long,
     )
+
+    // ---- physics shortcuts (ported from the Python desktop reference) ----
+    /**
+     * Probe the sim at effectively infinite T, measure uphill moves, and set
+     * the simulation's temperature so a typical uphill move is accepted with
+     * `target` probability. Returns the chosen temperature in Kelvin.
+     */
+    external fun nativeSimAutoTemperature(handle: Long, target: Double, samples: Long): Double
+    /** Re-seed the mobile gas uniformly over free cells; the paint layer is kept. */
+    external fun nativeSimAddUniformCharges(handle: Long)
 
     // ---- params ----
     external fun nativeSimSetParam(handle: Long, key: String, value: Double)

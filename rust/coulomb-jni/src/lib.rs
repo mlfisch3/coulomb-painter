@@ -24,7 +24,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use coulomb_core::{Brush, Params, Sim};
+use coulomb_core::{Brush, BrushTarget, CoolingSchedule, Params, Sim};
 use jni::objects::{JByteArray, JClass, JDoubleArray, JObject, JString};
 use jni::sys::{jboolean, jdouble, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
@@ -517,7 +517,9 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimPaintBegin
 
 /// Push the current brush shape into the handle. `sign` is applied per stroke
 /// at `paint_begin` time, so callers pass whatever sign they last showed the
-/// user and it is fine for the two calls to disagree.
+/// user and it is fine for the two calls to disagree. `target` is an integer
+/// code (0 = Fixed, 1 = Mobile) because the raw-f64 setter cannot carry an
+/// enum; a stray value defaults to Fixed to preserve pre-H18 behaviour.
 #[no_mangle]
 pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetBrush(
     _env: JNIEnv,
@@ -530,6 +532,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetBrush(
     hardness: jdouble,
     penetrability: jdouble,
     coupling: jdouble,
+    target: jlong,
 ) {
     guard((), || {
         // SAFETY: caller-owned handle; see handle_from doc comment.
@@ -548,6 +551,7 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimSetBrush(
         b.hardness = hardness.clamp(0.0, 1.0);
         b.penetrability = penetrability.clamp(0.0, 1.0);
         b.coupling = coupling.max(1.0);
+        b.target = if target == 1 { BrushTarget::Mobile } else { BrushTarget::Fixed };
         *h.brush.lock().unwrap() = b;
     })
 }
@@ -640,6 +644,56 @@ pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimClearPaint
         // reference does too. Bounded by the undo stack cap in coulomb-core.
         let mut sim = h.sim.lock().unwrap();
         while sim.undo_stroke() {}
+    })
+}
+
+/// Probe the sim at a very hot temperature, measure uphill energy
+/// contributions, then set T so a typical uphill move is accepted with
+/// probability `target` (default on the Kotlin side: 0.6, like the Python
+/// reference). Returns the chosen temperature, or the pre-call temperature
+/// when the sim produced no uphill moves.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimAutoTemperature(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    target: jdouble,
+    samples: jlong,
+) -> jdouble {
+    guard(f64::NAN, || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return f64::NAN;
+        };
+        let samples = samples.max(1) as usize;
+        let mut sim = h.sim.lock().unwrap();
+        sim.auto_temperature(target, samples)
+    })
+}
+
+/// Reseed the mobile gas uniformly across free cells, keeping the painted
+/// layer intact. The target count is the current occupancy, so the gas
+/// density after Reseed matches whatever the artist was tuning.
+#[no_mangle]
+pub extern "system" fn Java_com_coulombpainter_CoulombNative_nativeSimAddUniformCharges(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    guard((), || {
+        // SAFETY: caller-owned handle; see handle_from doc comment.
+        let Some(h) = (unsafe { handle_from(ptr) }) else {
+            return;
+        };
+        let mut sim = h.sim.lock().unwrap();
+        sim.add_uniform_charges();
+        drop(sim);
+        // Reseeding resets the "energy drop since last paint" baseline so the
+        // diagnostic one-liner reflects the settling of the fresh gas, not an
+        // accumulated drop against a bygone arrangement.
+        let energy = h.sim.lock().unwrap().stats().energy;
+        let mut telem = h.telem.lock().unwrap();
+        telem.baseline_energy = energy;
     })
 }
 
@@ -1228,6 +1282,16 @@ fn read_param(sim: &Sim, key: &str) -> f64 {
         "batch_decrement" => p.batch_decrement as f64,
         "fail_limit" => p.fail_limit as f64,
         "step_size" => p.step_size as f64,
+        "cooling" => if p.cooling { 1.0 } else { 0.0 },
+        "auto_cools" => if p.auto_cools { 1.0 } else { 0.0 },
+        "cooling_rate" => p.cooling_rate,
+        "schedule" => match p.schedule {
+            CoolingSchedule::Geometric => 0.0,
+            CoolingSchedule::Cosine => 1.0,
+        },
+        "reheat_amp" => p.reheat_amp,
+        "reheat_period" => p.reheat_period as f64,
+        "reheat_decay" => p.reheat_decay,
         _ => f64::NAN,
     }
 }
@@ -1251,6 +1315,16 @@ fn params_to_json(p: &Params) -> serde_json::Value {
         "batch_decrement": p.batch_decrement,
         "fail_limit": p.fail_limit,
         "step_size": p.step_size,
+        "cooling": p.cooling,
+        "auto_cools": p.auto_cools,
+        "cooling_rate": p.cooling_rate,
+        "schedule": match p.schedule {
+            CoolingSchedule::Geometric => "geometric",
+            CoolingSchedule::Cosine => "cosine",
+        },
+        "reheat_amp": p.reheat_amp,
+        "reheat_period": p.reheat_period,
+        "reheat_decay": p.reheat_decay,
     })
 }
 

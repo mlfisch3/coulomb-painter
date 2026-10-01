@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.GridOn
@@ -78,6 +79,7 @@ fun ParametersDrawer(
     onSnapshot: () -> Unit = {},
     onUndoStroke: () -> Unit = {},
     onClearPaint: () -> Unit = {},
+    onReseedGas: () -> Unit = {},
     onClose: () -> Unit = {},
 ) {
     ModalDrawerSheet(
@@ -193,6 +195,18 @@ fun ParametersDrawer(
                 label = "Snapshot PNG",
                 onClick = onSnapshot,
             )
+            // Reseed gas (H13): sprinkle a fresh mobile gas uniformly over
+            // free cells, keeping the painted layer. Different from Reset
+            // canvas, which discards both. The Python reference calls it
+            // "Add uniform charges"; the shorter label fits the drawer and
+            // the action is also what the captain's mental model expects
+            // after painting a wire-mesh they want to anneal against.
+            MenuRow(
+                icon = Icons.Filled.Autorenew,
+                iconDescription = "Reseed gas",
+                label = "Reseed gas",
+                onClick = onReseedGas,
+            )
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -285,15 +299,72 @@ fun ParametersDrawer(
                         onParamChange(k, v)
                     },
                 )
-                // Cooling schedule is owned by the painter-core-feature-port
-                // follow-up (the core has no cooling schedule yet). Tagged
-                // coming-soon so the user does not expect the rows to react.
-                ParamRow("cooling active", if (params.coolingActive) "on" else "off",
-                    onHelp = { onHelp("anneal.cooling_active") }, comingSoon = true)
-                ParamRow("schedule", params.schedule,
-                    onHelp = { onHelp("anneal.schedule") }, comingSoon = true)
-                ParamRow("cooling rate / 1000", "%.2f".format(params.coolingRate),
-                    onHelp = { onHelp("anneal.rate") }, comingSoon = true)
+                // Live cooling schedule (H10). `cooling` toggles the
+                // schedule on; `schedule` chooses geometric vs cosine (the
+                // cosine schedule rides a damped reheat wave on top of the
+                // same decaying baseline). The cosine-only reheat sliders
+                // appear below only when the schedule is cosine.
+                ParamRow(
+                    key = "cooling active",
+                    value = if (params.coolingActive) "on" else "off",
+                    onHelp = { onHelp("anneal.cooling_active") },
+                    onClickValue = {
+                        onParamChange("cooling", if (params.coolingActive) 0.0 else 1.0)
+                    },
+                )
+                ParamRow(
+                    key = "schedule",
+                    value = params.schedule,
+                    onHelp = { onHelp("anneal.schedule") },
+                    onClickValue = {
+                        onParamChange(
+                            "schedule",
+                            if (params.schedule == "cosine") 0.0 else 1.0,
+                        )
+                    },
+                )
+                ParamRow(
+                    key = "auto-T cools",
+                    value = if (params.autoCools) "on" else "off",
+                    onHelp = { onHelp("anneal.auto_cools") },
+                    onClickValue = {
+                        onParamChange("auto_cools", if (params.autoCools) 0.0 else 1.0)
+                    },
+                )
+                LiveSlider(
+                    label = "cooling rate / 1000",
+                    value = params.coolingRate,
+                    range = 0.5f..1.0f,
+                    key = "cooling_rate",
+                    onHelp = { onHelp("anneal.rate") },
+                    onCommit = onParamChange,
+                )
+                if (params.schedule == "cosine") {
+                    LiveSlider(
+                        label = "reheat amplitude",
+                        value = params.reheatAmp,
+                        range = 0.0f..4.0f,
+                        key = "reheat_amp",
+                        onHelp = { onHelp("anneal.reheat_amp") },
+                        onCommit = onParamChange,
+                    )
+                    LiveSlider(
+                        label = "reheat period",
+                        value = params.reheatPeriod.toDouble(),
+                        range = 1_000f..100_000f,
+                        key = "reheat_period",
+                        onHelp = { onHelp("anneal.reheat_period") },
+                        onCommit = onParamChange,
+                    )
+                    LiveSlider(
+                        label = "reheat decay / 1000",
+                        value = params.reheatDecay,
+                        range = 0.5f..1.0f,
+                        key = "reheat_decay",
+                        onHelp = { onHelp("anneal.reheat_decay") },
+                        onCommit = onParamChange,
+                    )
+                }
                 LiveSlider(
                     label = "batch",
                     value = params.batch.toDouble(),
